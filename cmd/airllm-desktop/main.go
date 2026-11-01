@@ -127,7 +127,7 @@ func newDesktopUI(window fyne.Window) *desktopUI {
 
 	ui.promptEntry = widget.NewMultiLineEntry()
 	ui.promptEntry.SetPlaceHolder("Введите запрос для модели…")
-	ui.promptEntry.SetMinRowsVisible(5)
+	ui.promptEntry.SetMinRowsVisible(3)
 
 	ui.memoryEntry = widget.NewEntry()
 	ui.memoryEntry.SetText(defaultMemory)
@@ -142,6 +142,7 @@ func newDesktopUI(window fyne.Window) *desktopUI {
 	ui.outputText = widget.NewLabel("Здесь появится результат генерации.")
 	ui.outputText.Wrapping = fyne.TextWrapWord
 	ui.outputScroll = container.NewVScroll(ui.outputText)
+	ui.outputScroll.SetMinSize(fyne.NewSize(0, 520))
 	ui.progress = widget.NewProgressBar()
 	ui.progress.SetValue(0)
 	ui.runButton = widget.NewButtonWithIcon("Запустить", theme.MediaPlayIcon(), ui.start)
