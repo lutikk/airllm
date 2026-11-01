@@ -1,477 +1,134 @@
-![airllm_logo](https://github.com/lyogavin/airllm/blob/main/assets/airllm_logo_sm.png?v=3&raw=true)
+# AirLLM Go
 
-## Native Go port (`go-port` branch)
+Нативный Go-форк AirLLM для локальной работы с большими языковыми моделями на компьютерах с ограниченным объёмом памяти. Проект развивается в ветке `go-port` и использует исходные файлы весов `safetensors`: они читаются по мере необходимости, без обязательной загрузки всей модели в ОЗУ или видеопамять.
 
-This fork is being rebuilt as a native, cross-platform Go application. The runtime reads original safetensors shards on demand instead of unpacking an entire model into RAM. The current foundation includes hardware detection, explicit memory budgets, Llama/Mistral configuration validation, and single- or multi-shard model inspection.
+## Цель
+
+Сделать инференс больших моделей предсказуемым на обычном оборудовании за счёт послойной обработки весов, явных лимитов памяти и минимального числа внешних зависимостей. Конечная цель — самодостаточный инструмент, который не требует установленного Python-окружения.
+
+## Текущий статус
+
+Проект находится в активной разработке. Сейчас доступны:
+
+- определение процессора, объёма ОЗУ, графического процессора и доступных бэкендов;
+- расчёт потребления памяти с учётом самого большого слоя, KV-кэша и рабочей области;
+- чтение конфигураций моделей семейств Llama и Mistral;
+- загрузка моделей с Hugging Face Hub в локальный кэш;
+- просмотр отдельных файлов `safetensors` и моделей, разбитых на несколько файлов;
+- потоковое чтение весов по мере необходимости;
+- послойная генерация текста с потоковым выводом токенов.
+
+**CPU reference inference работает, но предназначен прежде всего для проверки корректности и выполняется медленно.** Команда `airllm run` использует только процессор и не загружает всю модель в память целиком. Поддержка MLX/Metal и настольное приложение находятся в разработке.
+
+## Установка из исходников
+
+Требуется Go версии, указанной в `go.mod`, и Git.
 
 ```sh
+git clone https://github.com/lutikk/airllm.git
+cd airllm
+git checkout go-port
 go build -o bin/airllm ./cmd/airllm
+```
 
+После сборки исполняемый файл находится в `bin/airllm`. Для проверки установки выполните:
+
+```sh
+./bin/airllm help
+```
+
+## Команды
+
+### `run`: генерация текста на CPU
+
+Запускает послойный инференс модели Llama или Mistral и выводит каждый декодированный токен по мере генерации, пропуская специальные токены:
+
+```sh
+./bin/airllm run \
+  --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
+  --prompt "Напиши короткое приветствие" \
+  --tokens=32 \
+  --context=2048 \
+  --memory=4GiB
+```
+
+В `--model` можно передать ID репозитория Hugging Face или путь к локальному каталогу модели. Файлы из Hub сохраняются в `os.UserCacheDir()/airllm/models` и повторно используются при следующих запусках. Для локальной модели нужны `config.json`, `tokenizer.json` и веса `safetensors`.
+
+Перед открытием runtime команда рассчитывает память для Float32 CPU reference, включая резидентные веса, самый большой слой, KV-кэш и рабочую область 256 МиБ. Если `--memory` недостаточно, выводится русская ошибка с рекомендацией уменьшить `--context` или увеличить лимит.
+
+Это медленная эталонная реализация на CPU, а не Metal-инференс. Большие модели могут генерировать текст очень долго.
+
+### `doctor`: диагностика системы
+
+Показывает операционную систему, архитектуру, процессор, объём ОЗУ, графический процессор и доступность бэкендов Metal и CUDA.
+
+```sh
 ./bin/airllm doctor
-./bin/airllm inspect /path/to/model --context=2048 --limit=4GiB
-./bin/airllm inspect /path/to/model.safetensors
 ```
 
-The inference engine, MLX/Metal backend, and desktop interface are under active development. The Python implementation below remains available as the upstream reference.
+Для машиночитаемого вывода используйте JSON:
 
-
-[**Quickstart**](#quickstart) | 
-[**Configurations**](#configurations) | 
-[**MacOS**](#macos) | 
-[**Example notebooks**](#example-python-notebook) | 
-[**FAQ**](#faq)
-
-**AirLLM** dramatically reduces inference memory usage, letting 70B large language models run on a single 4GB GPU card — without quantization, distillation, or pruning. You can even run **Kimi K3 (2.8T)** — the largest open-source model released to date — on **under 4GB**, **Qwen3.8-Flash-Next (125B)** on **6GB**, and **DeepSeek-V3 (671B)** on **~12GB**. We now also support training huge models on small VRAM: **Qwen3.8-Flash-Next (125B)** under **6GB**.
-
-<a href="https://github.com/lyogavin/airllm/stargazers">![GitHub Repo stars](https://img.shields.io/github/stars/lyogavin/airllm?style=social)</a>
-[![Downloads](https://static.pepy.tech/personalized-badge/airllm?period=total&units=international_system&left_color=grey&right_color=blue&left_text=downloads)](https://pepy.tech/project/airllm)
-
-[![Code License](https://img.shields.io/badge/Code%20License-Apache_2.0-green.svg)](https://github.com/LianjiaTech/BELLE/blob/main/LICENSE)
-[![Generic badge](https://img.shields.io/badge/wechat-Anima-brightgreen?logo=wechat)](https://static.aicompose.cn/static/wecom_barcode.png?t=1671918938)
-[![Discord](https://img.shields.io/discord/1175437549783760896?logo=discord&color=7289da
-)](https://discord.gg/2xffU5sn)
-[![PyPI - AirLLM](https://img.shields.io/pypi/format/airllm?logo=pypi&color=3571a3)
-](https://pypi.org/project/airllm/)
-[![Website](https://img.shields.io/website?up_message=blog&url=https%3A%2F%2Fmedium.com%2F%40lyo.gavin&logo=medium&color=black)](https://medium.com/@lyo.gavin)
-[![Website](https://img.shields.io/badge/Gavin_Li-Blog-blue)](https://gavinliblog.com)
-[![Support me on Patreon](https://img.shields.io/endpoint.svg?url=https%3A%2F%2Fshieldsio-patreon.vercel.app%2Fapi%3Fusername%3Dgavinli%26type%3Dpatrons&style=flat)](https://patreon.com/gavinli)
-[![GitHub Sponsors](https://img.shields.io/github/sponsors/lyogavin?logo=GitHub&color=lightgray)](https://github.com/sponsors/lyogavin)
-
-## AI Agents Recommendation:
-
-* [Best AI Game Sprite Generator](https://godmodeai.co)
-
-* [Best AI Facial Expression Editor](https://crazyfaceai.com)
-
-## Updates
-[2026/09] **Training** support: stream frozen weights one layer at a time and keep adapters on the GPU. **Qwen3.8-Flash-Next (125B)** trains under **6GB** (RTX 3060 Ti); **Qwen3.8-27B** trains in **~2GB** at seq 512. See [Training](#training).
-
-[2026/08] **Qwen3.8-Flash-Next** support: Qwen's 125B MoE flagship (`Qwen4ExpForConditionalGeneration`) with a ~51B n-gram embedding runs in **5.95GB** of VRAM, measured end to end on one RTX 4090. The n-gram table is file-mapped on the host (a 64GB machine is enough); decoder layers stream. Needs a `transformers` build with in-tree `qwen4_exp` (`pip install git+https://github.com/huggingface/transformers.git` today) and ~360GB of checkpoint disk (`delete_original=True` reclaims the originals after the split).
-
-[2026/08] **Qwen3.8-27B** support: Qwen's new dense VL (Gated DeltaNet + Gated Attention, native vision) runs in **3.33GB** of VRAM, measured end to end on one RTX 3090. Needs `transformers` 5.8+.
-
-[2026/07] **Kimi K3 (2.8T)** support: the largest open-source model runs on a single card in **3.72GB** of VRAM, measured end to end on one RTX 6000 Ada. Per-expert streaming loads only the experts a token actually routes to. K3 brings three requirements of its own: `pip install compressed-tensors flash-attn` (its model code mandates flash attention regardless of what you request), a CUDA 12 build of torch, since no prebuilt flash-attn wheel exists for CUDA 13 yet, and `transformers` 4.56.x, as its remote code does not load on 5.x.
-
-[2026/06] **v3.0**: FP8 model support + the latest models. Run **DeepSeek-V3 (671B) on ~12GB** and **Qwen3-235B on ~3GB**, plus Qwen3, Llama 3.x/4, DeepSeek V2/V3, Phi-4, Gemma and more — all through a single `AutoModel`.
-
-[2024/08/20] v2.11.0: Support Qwen2.5
-
-[2024/08/18] v2.10.1 Support CPU inference. Support non sharded models. Thanks @NavodPeiris for the great work! 
-
-[2024/07/30] Support Llama3.1 **405B** ([example notebook](https://colab.research.google.com/github/lyogavin/airllm/blob/main/air_llm/examples/run_llama3.1_405B.ipynb)). Support **8bit/4bit quantization**.
-
-[2024/04/20] AirLLM supports Llama3 natively already. Run Llama3 70B on 4GB single GPU.
-
-[2023/12/25] v2.8.2: Support MacOS running 70B large language models.
-
-[2023/12/20] v2.7: Support AirLLMMixtral. 
-
-[2023/12/20] v2.6: Added AutoModel, automatically detect model type, no need to provide model class to initialize model.
-
-[2023/12/18] v2.5: added prefetching to overlap the model loading and compute. 10% speed improvement.
-
-[2023/12/03] added support of **ChatGLM**, **QWen**, **Baichuan**, **Mistral**, **InternLM**!
-
-[2023/12/02] added support for safetensors. Now support all top 10 models in open llm leaderboard.
-
-[2023/12/01] airllm 2.0. Support compressions: **3x run time speed up!**
-
-[2023/11/20] airllm Initial version!
-
-## Star History
-
-<a href="https://star-history.com/#lyogavin/airllm&Timeline">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="assets/star-history-dark.png">
-    <img alt="Star History Chart" src="assets/star-history.png">
-  </picture>
-</a>
-
-## Table of Contents
-
-* [Quick start](#quickstart)
-* [Model Compression](#model-compression---3x-inference-speed-up)
-* [Configurations](#configurations)
-* [Run on MacOS](#macos)
-* [Example notebooks](#example-python-notebook)
-* [Supported Models](#supported-models)
-* [Training](#training)
-* [Acknowledgement](#acknowledgement)
-* [FAQ](#faq)
-
-## Quickstart
-
-### 1. Install package
-
-First, install the airllm pip package.
-
-```bash
-pip install airllm
+```sh
+./bin/airllm doctor --json
 ```
 
-### 2. Inference
+### `memory`: расчёт лимита памяти
 
-Then, initialize AirLLMLlama2, pass in the huggingface repo ID of the model being used, or the local path, and inference can be performed similar to a regular transformer model.
+Оценивает минимально необходимую память устройства для заданной конфигурации. Команда учитывает самый большой слой, KV-кэш, временную рабочую область и дополнительный буфер предзагрузки.
 
-(*You can also specify the path to save the split layered model through **layer_shards_saving_path** when init AirLLMLlama2.*
-
-```python
-from airllm import AutoModel
-
-MAX_LENGTH = 128
-# just pass a hugging face repo id — works with almost any popular model:
-model = AutoModel.from_pretrained("Qwen/Qwen3-32B")
-
-# go bigger with the exact same one line:
-#model = AutoModel.from_pretrained("Qwen/Qwen3.8-27B")          # 27B dense VL, 3.33GB
-#model = AutoModel.from_pretrained("Qwen/Qwen3.8-Flash-Next")    # 125B MoE + 51B PLE, 5.95GB
-#model = AutoModel.from_pretrained("Qwen/Qwen3-235B-A22B")     # 235B, runs in ~3GB
-#model = AutoModel.from_pretrained("deepseek-ai/DeepSeek-V3")  # 671B, runs in ~12GB
-
-# or use a model's local path...
-#model = AutoModel.from_pretrained("/home/ubuntu/.cache/huggingface/hub/models--Qwen--Qwen3-32B/snapshots/...")
-
-input_text = [
-        'What is the capital of United States?',
-        #'I like',
-    ]
-
-input_tokens = model.tokenizer(input_text,
-    return_tensors="pt", 
-    return_attention_mask=False, 
-    truncation=True, 
-    max_length=MAX_LENGTH, 
-    padding=False)
-           
-generation_output = model.generate(
-    input_tokens['input_ids'].to(model.device), 
-    max_new_tokens=20,
-    use_cache=True,
-    return_dict_in_generate=True)
-
-output = model.tokenizer.decode(generation_output.sequences[0])
-
-print(output)
-
-```
- 
- 
-Note: During inference, the original model will first be decomposed and saved layer-wise. Please ensure there is sufficient disk space in the huggingface cache directory.
- 
-
-## Model Compression - 3x Inference Speed Up!
-
-We just added model compression based on block-wise quantization-based model compression. Which can further **speed up the inference speed** for up to **3x** , with **almost ignorable accuracy loss!** (see more performance evaluation and why we use block-wise quantization in [this paper](https://arxiv.org/abs/2212.09720))
-
-![speed_improvement](https://github.com/lyogavin/airllm/blob/main/assets/airllm2_time_improvement.png?v=2&raw=true)
-
-#### How to enable model compression speed up:
-
-* Step 1. make sure you have [bitsandbytes](https://github.com/TimDettmers/bitsandbytes) installed by `pip install -U bitsandbytes `
-* Step 2. make sure airllm version later than 2.0.0: `pip install -U airllm` 
-* Step 3. when initialize the model, passing the argument compression ('4bit' or '8bit'):
-
-```python
-model = AutoModel.from_pretrained("garage-bAInd/Platypus2-70B-instruct",
-                     compression='4bit' # specify '8bit' for 8-bit block-wise quantization 
-                    )
+```sh
+./bin/airllm memory \
+  --limit=4GiB \
+  --layers=22 \
+  --context=2048 \
+  --kv-heads=4 \
+  --head-dim=64
 ```
 
-#### What are the differences between model compression and quantization?
+Дополнительные параметры:
 
-Quantization normally needs to quantize both weights and activations to really speed things up. Which makes it harder to maintain accuracy and avoid the impact of outliers in all kinds of inputs.
+- `--max-layer` — размер самого большого слоя в байтах;
+- `--workspace` — размер временной рабочей области в байтах;
+- `--prefetch=false` — не резервировать второй буфер для предзагрузки следующего слоя.
 
-While in our case the bottleneck is mainly at the disk loading, we only need to make the model loading size smaller. So, we get to only quantize the weights' part, which is easier to ensure the accuracy.
+Если выбранный лимит недостаточен, команда сообщает об этом и предлагает способы снизить потребление памяти.
 
-## Configurations
- 
-When initialize the model, we support the following configurations:
+### `inspect`: проверка модели
 
-* **compression**: supported options: 4bit, 8bit for 4-bit or 8-bit block-wise quantization, or by default None for no compression
-* **profiling_mode**: supported options: True to output time consumptions or by default False
-* **layer_shards_saving_path**: optionally another path to save the split model
-* **hf_token**: huggingface token can be provided here if downloading gated models like: *meta-llama/Llama-2-7b-hf*
-* **prefetching**: prefetching to overlap the model loading and compute. By default, turned on. For now, only AirLLMLlama2 supports this.
-* **delete_original**: if you don't have too much disk space, you can set delete_original to true to delete the original downloaded hugging face model, only keep the transformed one to save half of the disk space. 
+Для каталога модели команда читает `config.json` и индекс весов, выводит архитектуру и параметры слоёв, а затем проверяет план памяти:
 
-## MacOS
-
-Just install airllm and run the code the same as on linux. See more in [Quick Start](#quickstart).
-
-* make sure you installed [mlx](https://github.com/ml-explore/mlx?tab=readme-ov-file#installation) and torch
-* you probably need to install python native see more [here](https://stackoverflow.com/a/65432861/21230266)
-* only [Apple silicon](https://support.apple.com/en-us/HT211814) is supported
-* only Llama-style models (`LlamaForCausalLM`, `MistralForCausalLM`) run on macOS for now; other architectures raise an error before anything is downloaded
-
-Example [python notebook] (https://github.com/lyogavin/airllm/blob/main/air_llm/examples/run_on_macos.ipynb)
-
-
-## Example Python Notebook
-
-Example colabs here:
-
-<a target="_blank" href="https://colab.research.google.com/github/lyogavin/airllm/blob/main/air_llm/examples/run_all_types_of_models.ipynb">
-  <img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab"/>
-</a>
-
-#### example of other models (ChatGLM, QWen, Baichuan, Mistral, etc):
-
-<details>
-
-
-* ChatGLM:
-
-```python
-from airllm import AutoModel
-MAX_LENGTH = 128
-model = AutoModel.from_pretrained("THUDM/chatglm3-6b-base")
-input_text = ['What is the capital of China?',]
-input_tokens = model.tokenizer(input_text,
-    return_tensors="pt", 
-    return_attention_mask=False, 
-    truncation=True, 
-    max_length=MAX_LENGTH, 
-    padding=True)
-generation_output = model.generate(
-    input_tokens['input_ids'].to(model.device), 
-    max_new_tokens=5,
-    use_cache= True,
-    return_dict_in_generate=True)
-model.tokenizer.decode(generation_output.sequences[0])
+```sh
+./bin/airllm inspect /путь/к/модели --context=2048 --limit=4GiB
 ```
 
-* QWen:
+Для отдельного файла `safetensors` выводится список тензоров, их типы, формы и общий объём:
 
-```python
-from airllm import AutoModel
-MAX_LENGTH = 128
-model = AutoModel.from_pretrained("Qwen/Qwen-7B")
-input_text = ['What is the capital of China?',]
-input_tokens = model.tokenizer(input_text,
-    return_tensors="pt", 
-    return_attention_mask=False, 
-    truncation=True, 
-    max_length=MAX_LENGTH)
-generation_output = model.generate(
-    input_tokens['input_ids'].to(model.device), 
-    max_new_tokens=5,
-    use_cache=True,
-    return_dict_in_generate=True)
-model.tokenizer.decode(generation_output.sequences[0])
+```sh
+./bin/airllm inspect /путь/к/model.safetensors
 ```
 
+Команда не преобразует модель и не загружает все её веса в память.
 
-* Baichuan, InternLM, Mistral, etc:
+## Потоковая обработка и лимиты памяти
 
-```python
-from airllm import AutoModel
-MAX_LENGTH = 128
-model = AutoModel.from_pretrained("baichuan-inc/Baichuan2-7B-Base")
-#model = AutoModel.from_pretrained("internlm/internlm-20b")
-#model = AutoModel.from_pretrained("mistralai/Mistral-7B-Instruct-v0.1")
-input_text = ['What is the capital of China?',]
-input_tokens = model.tokenizer(input_text,
-    return_tensors="pt", 
-    return_attention_mask=False, 
-    truncation=True, 
-    max_length=MAX_LENGTH)
-generation_output = model.generate(
-    input_tokens['input_ids'].to(model.device), 
-    max_new_tokens=5,
-    use_cache=True,
-    return_dict_in_generate=True)
-model.tokenizer.decode(generation_output.sequences[0])
+Основная идея AirLLM — обрабатывать модель последовательно, по слоям. Вместо размещения всех весов на устройстве среда читает нужную группу весов из исходных файлов `safetensors`, использует её и переходит к следующей. Предзагрузка позволяет подготовить следующий слой во время вычислений, но требует дополнительного буфера.
+
+Поэтому необходимый объём памяти зависит прежде всего от самого большого слоя, а не от полного размера модели. В расчёт также входят KV-кэш, рабочая область для вычислений и буфер предзагрузки. Больший контекст увеличивает KV-кэш, а при нехватке памяти можно уменьшить длину контекста или отключить предзагрузку.
+
+Лимит задаётся явно через `--limit`, например `--limit=4GiB`. Это бюджет для планирования, а не гарантия производительности: скорость работы зависит от диска, устройства, архитектуры модели и будущего вычислительного бэкенда.
+
+## Проверка разработки
+
+```sh
+gofmt -w ./cmd ./internal ./pkg
+go test ./...
 ```
 
+## Дорожная карта
 
-</details>
+1. Завершить вычислительный движок и послойный инференс поверх текущих примитивов чтения весов.
+2. Развивать поддержку бэкендов, включая MLX/Metal на Apple silicon.
+3. Собирать **один автономный бинарный файл для Linux** без необходимости устанавливать Python и дополнительное окружение.
+4. Собирать **одно автономное приложение `.app` для macOS** с настольным интерфейсом и встроенной средой выполнения.
 
-
-#### To request other model support: [here](https://docs.google.com/forms/d/e/1FAIpQLSe0Io9ANMT964Zi-OQOq1TJmnvP-G3_ZgQDhP7SatN0IEdbOg/viewform?usp=sf_link)
-
-
-
-## Supported Models
-
-AirLLM works out of the box with **virtually every popular open LLM** — just pass its Hugging Face ID to `AutoModel.from_pretrained(...)`. That covers all the major families:
-
-**Llama** (2 / 3 / 3.1 / 3.3 / 4) · **Qwen** (1 / 2 / 2.5 / 3 / 3.5 / 3.8, including MoE, Flash-Next, FP8, and native VL) · **DeepSeek** (V2 / V3 / R1) · **Mistral & Mixtral** · **Phi** · **Gemma** · **ChatGLM** · **Baichuan** · **InternLM** · **Yi** · **Kimi K3** — and most new models the day they're released.
-
-### Tiny GPU, huge models
-
-The trick: AirLLM only ever keeps **one layer on the GPU at a time**, so the VRAM you need depends on the model's layer size — not its total size. That's how a 671B model fits on a hobbyist card:
-
-| Model | Size | GPU VRAM |
-|---|---|---|
-| Qwen3 / Mistral / Phi (≈8B) | 8B | **~1–2 GB** |
-| Qwen3-30B / Mixtral (MoE) | 30–47B | **~1–3 GB** |
-| Qwen3.8-27B (dense VL) | 27B | **3.33 GB** |
-| Qwen3.8-Flash-Next (MoE + PLE) | ~180B | **5.95 GB** |
-| Qwen3-235B (MoE) | 235B | **~3 GB** |
-| Llama 3.x 70B (full precision) | 70B | **~4 GB** |
-| Llama 3.1 405B | 405B | **~8 GB** |
-| DeepSeek-V3 | **671B** | **~12 GB** |
-
-Same one line of code for all of them — no special setup.
-
-## Training
-
-AirLLM can fine-tune huge models on a small GPU. Frozen base weights stream from disk one decoder layer at a time; only the adapters stay resident. **Qwen3.8-Flash-Next (125B)** trains under **6GB**; **Qwen3.8-27B** trains in **~2GB** at seq 512.
-
-This is not Hugging Face Trainer / bitsandbytes QLoRA. Flash-Next needs a `transformers` build with in-tree `qwen4_exp` (`pip install git+https://github.com/huggingface/transformers.git` today).
-
-### 1. Prepare a dataset
-
-One JSON object per line (`.jsonl`). The usual field is `text` — next-token prediction over the whole string:
-
-```json
-{"text": "Your first training document. Can be a few sentences or a few paragraphs."}
-{"text": "Your second training document."}
-```
-
-Instruction pairs work too. Loss is applied on the completion only:
-
-```json
-{"prompt": "What is AirLLM?", "completion": "A library that runs and trains huge models on small VRAM."}
-{"instruction": "Translate to English", "input": "bonjour", "output": "hello"}
-```
-
-A `.txt` file is also fine: one example per blank-line-separated block. A two-line starter file lives at `air_llm/examples/sft_example.jsonl`.
-
-### 2. Run training
-
-From the repo root, point `--data` at your file:
-
-```bash
-python air_llm/examples/train_qwen38_flash_next_lora.py \
-  --data my_data.jsonl \
-  --seq-len 512 \
-  --epochs 1 \
-  --save-adapter qwen38-flash-next-lora.pt
-```
-
-For the 27B dense model:
-
-```bash
-python air_llm/examples/train_qwen38_lora.py \
-  --data my_data.jsonl \
-  --seq-len 512 \
-  --epochs 1 \
-  --save-adapter qwen38-27b-lora.pt
-```
-
-`--steps N` stops after N examples (useful for a smoke test). Omit `--data` and the script overfits a built-in snippet.
-
-### Python API
-
-```python
-from airllm import AirLLMLoRAQwen4Exp
-
-trainer = AirLLMLoRAQwen4Exp(
-    "Qwen/Qwen3.8-Flash-Next",
-    max_seq_len=512,
-    lora_r=16,
-    delete_original=True,
-)
-
-tok = trainer.tokenizer
-if tok.pad_token_id is None:
-    tok.pad_token = tok.eos_token
-
-encoded = tok(
-    "Your training text here.",
-    return_tensors="pt",
-    truncation=True,
-    max_length=512,
-)
-loss = trainer.train_step(
-    encoded["input_ids"].to(model.device),
-    attention_mask=encoded.get("attention_mask"),
-)
-print(loss)
-trainer.save_adapter("qwen38-flash-next-lora.pt")
-```
-
-`AirLLMLoRA` is the same API for `Qwen/Qwen3.8-27B`.
-
-## Acknowledgement
-
-A lot of the code are based on SimJeg's great work in the Kaggle exam competition. Big shoutout to SimJeg:
-
-[GitHub account @SimJeg](https://github.com/SimJeg), 
-[the code on Kaggle](https://www.kaggle.com/code/simjeg/platypus2-70b-with-wikipedia-rag), 
-[the associated discussion](https://www.kaggle.com/competitions/kaggle-llm-science-exam/discussion/446414).
-
-
-## FAQ
-
-### 1. MetadataIncompleteBuffer
-
-safetensors_rust.SafetensorError: Error while deserializing header: MetadataIncompleteBuffer
-
-If you run into this error, most possible cause is you run out of disk space. The process of splitting model is very disk-consuming. See [this](https://huggingface.co/TheBloke/guanaco-65B-GPTQ/discussions/12). You may need to extend your disk space, clear huggingface [.cache](https://huggingface.co/docs/datasets/cache) and rerun. 
-
-### 2. ValueError: max() arg is an empty sequence
-
-Most likely you are loading QWen or ChatGLM model with Llama2 class. Try the following:
-
-For QWen model: 
-
-```python
-from airllm import AutoModel #<----- instead of AirLLMLlama2
-AutoModel.from_pretrained(...)
-```
-
-For ChatGLM model: 
-
-```python
-from airllm import AutoModel #<----- instead of AirLLMLlama2
-AutoModel.from_pretrained(...)
-```
-
-### 3. 401 Client Error....Repo model ... is gated.
-
-Some models are gated models, needs huggingface api token. You can provide hf_token:
-
-```python
-model = AutoModel.from_pretrained("meta-llama/Llama-2-7b-hf", #hf_token='HF_API_TOKEN')
-```
-
-### 4. ValueError: Asking to pad but the tokenizer does not have a padding token.
-
-Some model's tokenizer doesn't have padding token, so you can set a padding token or simply turn the padding config off:
-
- ```python
-input_tokens = model.tokenizer(input_text,
-    return_tensors="pt", 
-    return_attention_mask=False, 
-    truncation=True, 
-    max_length=MAX_LENGTH, 
-    padding=False  #<-----------   turn off padding 
-)
-```
-
-## Citing AirLLM
-
-If you find
-AirLLM useful in your research and wish to cite it, please use the following
-BibTex entry:
-
-```
-@software{airllm2023,
-  author = {Gavin Li},
-  title = {AirLLM: scaling large language models on low-end commodity computers},
-  url = {https://github.com/lyogavin/airllm/},
-  version = {0.0},
-  year = {2023},
-}
-```
-
-
-## Contribution 
-
-Welcomed contributions, ideas and discussions!
-
-If you find it useful, please ⭐ or buy me a coffee! 🙏
-
-[!["Buy Me A Coffee"](https://www.buymeacoffee.com/assets/img/custom_images/orange_img.png)](https://bmc.link/lyogavinQ)
+Исторический Python-код пока сохраняется в репозитории как справочная реализация, но не описывает текущие возможности Go CLI.

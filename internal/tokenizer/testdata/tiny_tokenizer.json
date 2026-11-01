@@ -1,0 +1,112 @@
+{
+  "version": "1.0",
+  "truncation": null,
+  "padding": null,
+  "added_tokens": [
+    {
+      "id": 0,
+      "content": "<unk>",
+      "single_word": false,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": true
+    },
+    {
+      "id": 1,
+      "content": "<s>",
+      "single_word": false,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": true
+    },
+    {
+      "id": 2,
+      "content": "</s>",
+      "single_word": false,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": true
+    }
+  ],
+  "normalizer": null,
+  "pre_tokenizer": {
+    "type": "Metaspace",
+    "replacement": "▁",
+    "add_prefix_space": true,
+    "prepend_scheme": "always",
+    "split": true
+  },
+  "post_processor": {
+    "type": "TemplateProcessing",
+    "single": [
+      {"SpecialToken": {"id": "<s>", "type_id": 0}},
+      {"Sequence": {"id": "A", "type_id": 0}}
+    ],
+    "pair": [
+      {"SpecialToken": {"id": "<s>", "type_id": 0}},
+      {"Sequence": {"id": "A", "type_id": 0}},
+      {"Sequence": {"id": "B", "type_id": 1}}
+    ],
+    "special_tokens": {
+      "<s>": {"id": "<s>", "ids": [1], "tokens": ["<s>"]}
+    }
+  },
+  "decoder": {
+    "type": "Sequence",
+    "decoders": [
+      {"type": "Replace", "pattern": {"String": "▁"}, "content": " "},
+      {"type": "ByteFallback"},
+      {"type": "Fuse"},
+      {"type": "Strip", "content": " ", "start": 1, "stop": 0}
+    ]
+  },
+  "model": {
+    "type": "BPE",
+    "dropout": null,
+    "unk_token": "<unk>",
+    "continuing_subword_prefix": null,
+    "end_of_word_suffix": null,
+    "fuse_unk": false,
+    "byte_fallback": true,
+    "vocab": {
+      "<unk>": 0,
+      "<s>": 1,
+      "</s>": 2,
+      "▁": 3,
+      "h": 4,
+      "e": 5,
+      "l": 6,
+      "o": 7,
+      "w": 8,
+      "r": 9,
+      "d": 10,
+      "▁h": 11,
+      "▁he": 12,
+      "▁hel": 13,
+      "▁hell": 14,
+      "▁hello": 15,
+      "▁w": 16,
+      "▁wo": 17,
+      "▁wor": 18,
+      "▁worl": 19,
+      "▁world": 20,
+      "<0xC3>": 21,
+      "<0xA9>": 22
+    },
+    "merges": [
+      "▁ h",
+      "▁h e",
+      "▁he l",
+      "▁hel l",
+      "▁hell o",
+      "▁ w",
+      "▁w o",
+      "▁wo r",
+      "▁wor l",
+      "▁worl d"
+    ]
+  }
+}
