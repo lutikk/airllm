@@ -158,26 +158,36 @@ func TestGPTOSSMetadataDialects(t *testing.T) {
 
 func TestGPTOSSTensorMapping(t *testing.T) {
 	mapping := map[string]string{
-		"token_embd.weight":             "model.embed_tokens.weight",
-		"output_norm.weight":            "model.norm.weight",
-		"output.weight":                 "lm_head.weight",
-		"blk.3.attn_norm.weight":        "model.layers.3.input_layernorm.weight",
-		"blk.3.attn_qkv.weight":         "model.layers.3.self_attn.qkv_proj.weight",
-		"blk.3.attn_qkv.bias":           "model.layers.3.self_attn.qkv_proj.bias",
-		"blk.3.attn_sinks.weight":       "model.layers.3.self_attn.sinks",
-		"blk.3.attn_output.weight":      "model.layers.3.self_attn.o_proj.weight",
-		"blk.3.attn_output.bias":        "model.layers.3.self_attn.o_proj.bias",
-		"blk.3.ffn_norm.weight":         "model.layers.3.post_attention_layernorm.weight",
-		"blk.3.ffn_gate_inp.weight":     "model.layers.3.mlp.router.weight",
-		"blk.3.ffn_gate_inp.bias":       "model.layers.3.mlp.router.bias",
-		"blk.3.ffn_gate_up_exps.weight": "model.layers.3.mlp.experts.gate_up_proj",
-		"blk.3.ffn_gate_up_exps.bias":   "model.layers.3.mlp.experts.gate_up_proj_bias",
-		"blk.3.ffn_gate_exps.weight":    "model.layers.3.mlp.experts.gate_proj",
-		"blk.3.ffn_gate_exps.bias":      "model.layers.3.mlp.experts.gate_proj_bias",
-		"blk.3.ffn_up_exps.weight":      "model.layers.3.mlp.experts.up_proj",
-		"blk.3.ffn_up_exps.bias":        "model.layers.3.mlp.experts.up_proj_bias",
-		"blk.3.ffn_down_exps.weight":    "model.layers.3.mlp.experts.down_proj",
-		"blk.3.ffn_down_exps.bias":      "model.layers.3.mlp.experts.down_proj_bias",
+		"token_embd.weight":                "model.embed_tokens.weight",
+		"output_norm.weight":               "model.norm.weight",
+		"output.weight":                    "lm_head.weight",
+		"blk.3.attn_norm.weight":           "model.layers.3.input_layernorm.weight",
+		"blk.3.attn_qkv.weight":            "model.layers.3.self_attn.qkv_proj.weight",
+		"blk.3.attn_qkv.bias":              "model.layers.3.self_attn.qkv_proj.bias",
+		"blk.3.attn_q.weight":              "model.layers.3.self_attn.q_proj.weight",
+		"blk.3.attn_q.bias":                "model.layers.3.self_attn.q_proj.bias",
+		"blk.3.attn_k.weight":              "model.layers.3.self_attn.k_proj.weight",
+		"blk.3.attn_k.bias":                "model.layers.3.self_attn.k_proj.bias",
+		"blk.3.attn_v.weight":              "model.layers.3.self_attn.v_proj.weight",
+		"blk.3.attn_v.bias":                "model.layers.3.self_attn.v_proj.bias",
+		"blk.3.attn_sinks.weight":          "model.layers.3.self_attn.sinks",
+		"blk.3.attn_sinks":                 "model.layers.3.self_attn.sinks",
+		"blk.3.attn_output.weight":         "model.layers.3.self_attn.o_proj.weight",
+		"blk.3.attn_output.bias":           "model.layers.3.self_attn.o_proj.bias",
+		"blk.3.attn_out.weight":            "model.layers.3.self_attn.o_proj.weight",
+		"blk.3.attn_out.bias":              "model.layers.3.self_attn.o_proj.bias",
+		"blk.3.ffn_norm.weight":            "model.layers.3.post_attention_layernorm.weight",
+		"blk.3.post_attention_norm.weight": "model.layers.3.post_attention_layernorm.weight",
+		"blk.3.ffn_gate_inp.weight":        "model.layers.3.mlp.router.weight",
+		"blk.3.ffn_gate_inp.bias":          "model.layers.3.mlp.router.bias",
+		"blk.3.ffn_gate_up_exps.weight":    "model.layers.3.mlp.experts.gate_up_proj",
+		"blk.3.ffn_gate_up_exps.bias":      "model.layers.3.mlp.experts.gate_up_proj_bias",
+		"blk.3.ffn_gate_exps.weight":       "model.layers.3.mlp.experts.gate_proj",
+		"blk.3.ffn_gate_exps.bias":         "model.layers.3.mlp.experts.gate_proj_bias",
+		"blk.3.ffn_up_exps.weight":         "model.layers.3.mlp.experts.up_proj",
+		"blk.3.ffn_up_exps.bias":           "model.layers.3.mlp.experts.up_proj_bias",
+		"blk.3.ffn_down_exps.weight":       "model.layers.3.mlp.experts.down_proj",
+		"blk.3.ffn_down_exps.bias":         "model.layers.3.mlp.experts.down_proj_bias",
 	}
 	for source, want := range mapping {
 		got, ok := GPTOSSTensorName(source)
@@ -185,7 +195,7 @@ func TestGPTOSSTensorMapping(t *testing.T) {
 			t.Errorf("GPTOSSTensorName(%q) = %q, %v; want %q, true", source, got, ok, want)
 		}
 	}
-	for _, source := range []string{"blk.x.attn_qkv.weight", "blk.3.attn_q.weight", "output.bias"} {
+	for _, source := range []string{"blk.x.attn_qkv.weight", "blk.3.attn_unknown.weight", "output.bias"} {
 		if got, ok := GPTOSSTensorName(source); ok {
 			t.Errorf("GPTOSSTensorName(%q) unexpectedly mapped to %q", source, got)
 		}

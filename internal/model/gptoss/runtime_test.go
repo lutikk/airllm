@@ -74,6 +74,41 @@ func TestRuntimeSyntheticNativeGGUFEndToEnd(t *testing.T) {
 	}
 }
 
+func TestRuntimeSyntheticSeparateAttentionEndToEnd(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "tiny-separate.gguf")
+	writeSyntheticGPTOSSDialect(t, path, true)
+	if _, err := gguf.PrepareGPTOSSTokenizer(path, filepath.Dir(path)); err != nil {
+		t.Fatal(err)
+	}
+	runtime, err := Open(path, 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.Close()
+
+	layer, err := runtime.loadDecoderLayer(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []float32{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}; !reflect.DeepEqual(layer.weights.qkv, want) {
+		t.Fatalf("fused QKV weights = %v, want Q||K||V %v", layer.weights.qkv, want)
+	}
+	if want := []float32{1, 2, 3, 4, 5, 6}; !reflect.DeepEqual(layer.weights.qkvBias, want) {
+		t.Fatalf("fused QKV biases = %v, want Q||K||V %v", layer.weights.qkvBias, want)
+	}
+
+	var generated []uint32
+	if err := runtime.Generate(context.Background(), []uint32{0}, 5, func(token uint32) error {
+		generated = append(generated, token)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if want := []uint32{1, 2}; !reflect.DeepEqual(generated, want) {
+		t.Fatalf("generated tokens = %v, want %v", generated, want)
+	}
+}
+
 type syntheticTensor struct {
 	name   string
 	shape  []uint64
@@ -81,6 +116,11 @@ type syntheticTensor struct {
 }
 
 func writeSyntheticGPTOSS(t *testing.T, path string) {
+	t.Helper()
+	writeSyntheticGPTOSSDialect(t, path, false)
+}
+
+func writeSyntheticGPTOSSDialect(t *testing.T, path string, separateAttention bool) {
 	t.Helper()
 	metadata := map[string]any{
 		"general.architecture":                        "gptoss",
@@ -112,14 +152,31 @@ func writeSyntheticGPTOSS(t *testing.T, path string) {
 	}
 	for layer := 0; layer < 2; layer++ {
 		prefix := "blk." + string(rune('0'+layer)) + "."
+		tensors = append(tensors, syntheticTensor{name: prefix + "attn_norm.weight", shape: []uint64{2}, values: []float32{1, 1}})
+		if separateAttention {
+			tensors = append(tensors,
+				syntheticTensor{name: prefix + "attn_q.weight", shape: []uint64{2, 2}, values: []float32{1, 2, 3, 4}},
+				syntheticTensor{name: prefix + "attn_q.bias", shape: []uint64{2}, values: []float32{1, 2}},
+				syntheticTensor{name: prefix + "attn_k.weight", shape: []uint64{2, 2}, values: []float32{5, 6, 7, 8}},
+				syntheticTensor{name: prefix + "attn_k.bias", shape: []uint64{2}, values: []float32{3, 4}},
+				syntheticTensor{name: prefix + "attn_v.weight", shape: []uint64{2, 2}, values: []float32{9, 10, 11, 12}},
+				syntheticTensor{name: prefix + "attn_v.bias", shape: []uint64{2}, values: []float32{5, 6}},
+				syntheticTensor{name: prefix + "attn_sinks", shape: []uint64{1}, values: make([]float32, 1)},
+				syntheticTensor{name: prefix + "attn_out.weight", shape: []uint64{2, 2}, values: make([]float32, 4)},
+				syntheticTensor{name: prefix + "attn_out.bias", shape: []uint64{2}, values: make([]float32, 2)},
+				syntheticTensor{name: prefix + "post_attention_norm.weight", shape: []uint64{2}, values: []float32{1, 1}},
+			)
+		} else {
+			tensors = append(tensors,
+				syntheticTensor{name: prefix + "attn_qkv.weight", shape: []uint64{2, 6}, values: make([]float32, 12)},
+				syntheticTensor{name: prefix + "attn_qkv.bias", shape: []uint64{6}, values: make([]float32, 6)},
+				syntheticTensor{name: prefix + "attn_sinks.weight", shape: []uint64{1}, values: make([]float32, 1)},
+				syntheticTensor{name: prefix + "attn_output.weight", shape: []uint64{2, 2}, values: make([]float32, 4)},
+				syntheticTensor{name: prefix + "attn_output.bias", shape: []uint64{2}, values: make([]float32, 2)},
+				syntheticTensor{name: prefix + "ffn_norm.weight", shape: []uint64{2}, values: []float32{1, 1}},
+			)
+		}
 		tensors = append(tensors,
-			syntheticTensor{name: prefix + "attn_norm.weight", shape: []uint64{2}, values: []float32{1, 1}},
-			syntheticTensor{name: prefix + "attn_qkv.weight", shape: []uint64{2, 6}, values: make([]float32, 12)},
-			syntheticTensor{name: prefix + "attn_qkv.bias", shape: []uint64{6}, values: make([]float32, 6)},
-			syntheticTensor{name: prefix + "attn_sinks.weight", shape: []uint64{1}, values: make([]float32, 1)},
-			syntheticTensor{name: prefix + "attn_output.weight", shape: []uint64{2, 2}, values: make([]float32, 4)},
-			syntheticTensor{name: prefix + "attn_output.bias", shape: []uint64{2}, values: make([]float32, 2)},
-			syntheticTensor{name: prefix + "ffn_norm.weight", shape: []uint64{2}, values: []float32{1, 1}},
 			syntheticTensor{name: prefix + "ffn_gate_inp.weight", shape: []uint64{2, 4}, values: make([]float32, 8)},
 			syntheticTensor{name: prefix + "ffn_gate_inp.bias", shape: []uint64{4}, values: make([]float32, 4)},
 			syntheticTensor{name: prefix + "ffn_gate_up_exps.weight", shape: []uint64{2, 4, 4}, values: make([]float32, 32)},

@@ -50,18 +50,35 @@ func (r *Runtime) loadDecoderLayer(index int) (DecoderLayer, error) {
 		shape       []int
 	}{
 		{"attn_norm.weight", &weights.norm1, []int{config.HiddenSize}},
-		{"attn_qkv.weight", &weights.qkv, []int{config.HiddenSize, qkvWidth}},
-		{"attn_qkv.bias", &weights.qkvBias, []int{qkvWidth}},
-		{"attn_sinks.weight", &weights.sinks, []int{config.NumHeads}},
-		{"attn_output.weight", &weights.output, []int{queryWidth, config.HiddenSize}},
-		{"attn_output.bias", &weights.outputBias, []int{config.HiddenSize}},
-		{"ffn_norm.weight", &weights.norm2, []int{config.HiddenSize}},
 		{"ffn_gate_inp.weight", &weights.router, []int{config.HiddenSize, config.NumExperts}},
 		{"ffn_gate_inp.bias", &weights.routerBias, []int{config.NumExperts}},
 	} {
 		if !read(item.name, item.destination, item.shape...) {
 			return DecoderLayer{}, fmt.Errorf("gptoss: load layer %d: %w", index, err)
 		}
+	}
+	if _, fused := r.source.reader.Tensor(prefix + "attn_qkv.weight"); fused {
+		weights.qkv, err = r.source.read(prefix+"attn_qkv.weight", config.HiddenSize, qkvWidth)
+		if err == nil {
+			weights.qkvBias, err = r.source.read(prefix+"attn_qkv.bias", qkvWidth)
+		}
+	} else {
+		weights.qkv, weights.qkvBias, err = r.source.readSeparateQKV(prefix, config.HiddenSize, queryWidth, kvWidth)
+	}
+	if err != nil {
+		return DecoderLayer{}, fmt.Errorf("gptoss: load layer %d QKV: %w", index, err)
+	}
+	if weights.sinks, err = r.source.readAlias(prefix, []string{"attn_sinks.weight", "attn_sinks"}, config.NumHeads); err != nil {
+		return DecoderLayer{}, fmt.Errorf("gptoss: load layer %d sinks: %w", index, err)
+	}
+	if weights.output, err = r.source.readAlias(prefix, []string{"attn_output.weight", "attn_out.weight"}, queryWidth, config.HiddenSize); err != nil {
+		return DecoderLayer{}, fmt.Errorf("gptoss: load layer %d output: %w", index, err)
+	}
+	if weights.outputBias, err = r.source.readAlias(prefix, []string{"attn_output.bias", "attn_out.bias"}, config.HiddenSize); err != nil {
+		return DecoderLayer{}, fmt.Errorf("gptoss: load layer %d output bias: %w", index, err)
+	}
+	if weights.norm2, err = r.source.readAlias(prefix, []string{"ffn_norm.weight", "post_attention_norm.weight"}, config.HiddenSize); err != nil {
+		return DecoderLayer{}, fmt.Errorf("gptoss: load layer %d post-attention norm: %w", index, err)
 	}
 
 	if _, ok := r.source.reader.Tensor(prefix + "ffn_gate_up_exps.weight"); ok {
@@ -103,4 +120,50 @@ func (r *Runtime) loadDecoderLayer(index int) (DecoderLayer, error) {
 		window = config.SlidingWindow
 	}
 	return DecoderLayer{config: config, weights: weights, slidingWindow: window}, nil
+}
+
+func (s *tensorSource) readAlias(prefix string, names []string, shape ...int) ([]float32, error) {
+	for _, name := range names {
+		if _, ok := s.reader.Tensor(prefix + name); ok {
+			return s.read(prefix+name, shape...)
+		}
+	}
+	return nil, fmt.Errorf("gptoss: none of tensors %v found", names)
+}
+
+func (s *tensorSource) readSeparateQKV(prefix string, hidden, queryWidth, kvWidth int) ([]float32, []float32, error) {
+	q, err := s.read(prefix+"attn_q.weight", hidden, queryWidth)
+	if err != nil {
+		return nil, nil, err
+	}
+	k, err := s.read(prefix+"attn_k.weight", hidden, kvWidth)
+	if err != nil {
+		return nil, nil, err
+	}
+	v, err := s.read(prefix+"attn_v.weight", hidden, kvWidth)
+	if err != nil {
+		return nil, nil, err
+	}
+	qBias, err := s.read(prefix+"attn_q.bias", queryWidth)
+	if err != nil {
+		return nil, nil, err
+	}
+	kBias, err := s.read(prefix+"attn_k.bias", kvWidth)
+	if err != nil {
+		return nil, nil, err
+	}
+	vBias, err := s.read(prefix+"attn_v.bias", kvWidth)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	weights := make([]float32, 0, len(q)+len(k)+len(v))
+	weights = append(weights, q...)
+	weights = append(weights, k...)
+	weights = append(weights, v...)
+	biases := make([]float32, 0, len(qBias)+len(kBias)+len(vBias))
+	biases = append(biases, qBias...)
+	biases = append(biases, kBias...)
+	biases = append(biases, vBias...)
+	return weights, biases, nil
 }

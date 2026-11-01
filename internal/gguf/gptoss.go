@@ -145,30 +145,45 @@ func GPTOSSTensorName(name string) (string, bool) {
 		return "lm_head.weight", true
 	}
 	parts := strings.Split(name, ".")
-	if len(parts) != 4 || parts[0] != "blk" {
+	if (len(parts) != 3 && len(parts) != 4) || parts[0] != "blk" {
 		return "", false
 	}
 	if _, err := strconv.ParseUint(parts[1], 10, 31); err != nil {
 		return "", false
 	}
+	if len(parts) == 3 {
+		if parts[2] == "attn_sinks" {
+			return "model.layers." + parts[1] + ".self_attn.sinks", true
+		}
+		return "", false
+	}
 	mapped, ok := map[string]string{
-		"attn_norm.weight":        "input_layernorm.weight",
-		"attn_qkv.weight":         "self_attn.qkv_proj.weight",
-		"attn_qkv.bias":           "self_attn.qkv_proj.bias",
-		"attn_sinks.weight":       "self_attn.sinks",
-		"attn_output.weight":      "self_attn.o_proj.weight",
-		"attn_output.bias":        "self_attn.o_proj.bias",
-		"ffn_norm.weight":         "post_attention_layernorm.weight",
-		"ffn_gate_inp.weight":     "mlp.router.weight",
-		"ffn_gate_inp.bias":       "mlp.router.bias",
-		"ffn_gate_up_exps.weight": "mlp.experts.gate_up_proj",
-		"ffn_gate_up_exps.bias":   "mlp.experts.gate_up_proj_bias",
-		"ffn_gate_exps.weight":    "mlp.experts.gate_proj",
-		"ffn_gate_exps.bias":      "mlp.experts.gate_proj_bias",
-		"ffn_up_exps.weight":      "mlp.experts.up_proj",
-		"ffn_up_exps.bias":        "mlp.experts.up_proj_bias",
-		"ffn_down_exps.weight":    "mlp.experts.down_proj",
-		"ffn_down_exps.bias":      "mlp.experts.down_proj_bias",
+		"attn_norm.weight":           "input_layernorm.weight",
+		"attn_qkv.weight":            "self_attn.qkv_proj.weight",
+		"attn_qkv.bias":              "self_attn.qkv_proj.bias",
+		"attn_q.weight":              "self_attn.q_proj.weight",
+		"attn_q.bias":                "self_attn.q_proj.bias",
+		"attn_k.weight":              "self_attn.k_proj.weight",
+		"attn_k.bias":                "self_attn.k_proj.bias",
+		"attn_v.weight":              "self_attn.v_proj.weight",
+		"attn_v.bias":                "self_attn.v_proj.bias",
+		"attn_sinks.weight":          "self_attn.sinks",
+		"attn_output.weight":         "self_attn.o_proj.weight",
+		"attn_output.bias":           "self_attn.o_proj.bias",
+		"attn_out.weight":            "self_attn.o_proj.weight",
+		"attn_out.bias":              "self_attn.o_proj.bias",
+		"ffn_norm.weight":            "post_attention_layernorm.weight",
+		"post_attention_norm.weight": "post_attention_layernorm.weight",
+		"ffn_gate_inp.weight":        "mlp.router.weight",
+		"ffn_gate_inp.bias":          "mlp.router.bias",
+		"ffn_gate_up_exps.weight":    "mlp.experts.gate_up_proj",
+		"ffn_gate_up_exps.bias":      "mlp.experts.gate_up_proj_bias",
+		"ffn_gate_exps.weight":       "mlp.experts.gate_proj",
+		"ffn_gate_exps.bias":         "mlp.experts.gate_proj_bias",
+		"ffn_up_exps.weight":         "mlp.experts.up_proj",
+		"ffn_up_exps.bias":           "mlp.experts.up_proj_bias",
+		"ffn_down_exps.weight":       "mlp.experts.down_proj",
+		"ffn_down_exps.bias":         "mlp.experts.down_proj_bias",
 	}[parts[2]+"."+parts[3]]
 	if !ok {
 		return "", false
