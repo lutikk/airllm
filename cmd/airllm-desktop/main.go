@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/app"
@@ -87,6 +88,7 @@ type desktopUI struct {
 	contextEntry   *widget.Entry
 	tokensEntry    *widget.Entry
 	hardwareText   *widget.Label
+	memoryText     *widget.Label
 	diskSpaceText  *widget.Label
 	statusText     *widget.Label
 	outputText     *widget.Label
@@ -137,6 +139,7 @@ func newDesktopUI(window fyne.Window) *desktopUI {
 	ui.tokensEntry.SetText(defaultTokens)
 
 	ui.hardwareText = sectionLabel("Определение оборудования…")
+	ui.memoryText = sectionLabel("Измерение памяти процесса…")
 	ui.diskSpaceText = sectionLabel("Определение свободного места…")
 	ui.statusText = sectionLabel("Готово. Используется медленный CPU reference; Metal пока не задействован.")
 	ui.outputText = widget.NewLabel("Здесь появится результат генерации.")
@@ -191,13 +194,13 @@ func newDesktopUI(window fyne.Window) *desktopUI {
 		directorySettings,
 	))
 
-	memoryField := container.NewVBox(sectionLabel("Лимит памяти"), ui.memoryEntry)
+	memoryField := container.NewVBox(sectionLabel("Бюджет движка"), ui.memoryEntry)
 	contextField := container.NewVBox(sectionLabel("Контекст"), ui.contextEntry)
 	tokensField := container.NewVBox(sectionLabel("Новых токенов"), ui.tokensEntry)
-	generationSettings := styledCard("Параметры генерации", "", container.NewGridWithColumns(2,
+	generationSettings := styledCard("Параметры генерации", "Бюджет весов и вычислений, не всего процесса", container.NewGridWithColumns(2,
 		memoryField, contextField, tokensField,
 	))
-	hardwareCard := styledCard("Среда выполнения", "", ui.hardwareText)
+	hardwareCard := styledCard("Среда выполнения", "", container.NewVBox(ui.hardwareText, ui.memoryText))
 	settingsScroll := container.NewVScroll(container.NewVBox(modelSettings, generationSettings, hardwareCard))
 	actions := container.NewGridWithColumns(2, ui.runButton, ui.cancelButton)
 	left := container.NewPadded(container.NewBorder(nil, container.NewVBox(actions, ui.statusText), nil, nil, settingsScroll))
@@ -214,6 +217,20 @@ func newDesktopUI(window fyne.Window) *desktopUI {
 	go func() {
 		summary := hardwareSummary(hardware.Probe())
 		fyne.Do(func() { ui.hardwareText.SetText(summary) })
+	}()
+	go func() {
+		ticker := time.NewTicker(2 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			rss, err := processRSS()
+			fyne.Do(func() {
+				if err != nil {
+					ui.memoryText.SetText("Память процесса не определена")
+					return
+				}
+				ui.memoryText.SetText("Фактическая память приложения: " + formatByteSize(rss))
+			})
+		}
 	}()
 	return ui
 }
