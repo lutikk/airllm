@@ -643,13 +643,18 @@ func visibleHarmonyText(decoded string) string {
 	parser := harmony.NewParser(harmony.Options{})
 	events, err := parser.WriteText(decoded)
 	if err != nil {
-		return ""
+		return decoded
 	}
 	var output strings.Builder
 	for _, event := range events {
 		if event.Type == harmony.EventText {
 			output.WriteString(event.Text)
 		}
+	}
+	// During a long analysis phase Harmony has no user-visible channel yet.
+	// Never turn successful generation into a mysteriously empty answer pane.
+	if output.Len() == 0 {
+		return decoded
 	}
 	return output.String()
 }
