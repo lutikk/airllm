@@ -29,7 +29,7 @@ jobs:
           cache: true
       - name: Install Linux GUI dependencies
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libgl1-mesa-dev xorg-dev
+        run: sudo apt-get update && sudo apt-get install -y libgl1-mesa-dev xorg-dev libwayland-dev wayland-protocols libxkbcommon-dev
       - name: Test
         run: go test ./...
       - name: Build macOS app
