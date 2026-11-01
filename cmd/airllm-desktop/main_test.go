@@ -37,6 +37,18 @@ func TestReadDownloadParams(t *testing.T) {
 		t.Fatalf("unexpected params: %+v", params)
 	}
 
+	ui.sourceSelect.SetSelected(sourceHuggingFace)
+	params, err = ui.readDownloadParams()
+	if err != nil || params.source != sourceOllama {
+		t.Fatalf("name:tag should select Ollama automatically: %+v, %v", params, err)
+	}
+
+	ui.modelEntry.SetText("gpt-oss:120b")
+	ui.sourceSelect.SetSelected(sourceOllama)
+	if _, err := ui.readDownloadParams(); err == nil || !strings.Contains(err.Error(), "не поддерживается") {
+		t.Fatalf("gpt-oss should be rejected before downloading: %v", err)
+	}
+
 	ui.sourceSelect.Selected = ""
 	if _, err := ui.readDownloadParams(); err == nil {
 		t.Fatal("readDownloadParams accepted an empty source")

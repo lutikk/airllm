@@ -42,7 +42,7 @@ const (
 Выберите источник Ollama, укажите ссылку вроде tinyllama:latest и нажмите «Загрузить». AirLLM скачивает GGUF напрямую из Ollama registry: установленная Ollama, её daemon и API не нужны. Затем GGUF конвертируется в локальную модель AirLLM, а поле «Модель» автоматически получает её путь.
 
 Поддерживаемые GGUF
-Конвертация поддерживает Llama-тензоры F32, F16, Q8_0 и Q4_0. Другие квантования пока не поддерживаются: конвертация завершится ошибкой. Результат содержит config.json, tokenizer.json и веса safetensors F16.
+Конвертация поддерживает Llama-тензоры F32, F16, Q8_0, Q4_0, Q4_K, Q5_K и Q6_K. Результат содержит config.json, tokenizer.json и веса safetensors F16. Другие архитектуры, включая gpt-oss, пока не поддерживаются: выберите tinyllama:latest или Llama-совместимую модель.
 
 Закрытые модели
 Если репозиторий gated или private, сначала получите доступ на его странице. Затем создайте токен в настройках Hugging Face и задайте переменную окружения HF_TOKEN до запуска AirLLM. Не вставляйте токен в поле модели.
@@ -305,6 +305,14 @@ func (ui *desktopUI) readDownloadParams() (downloadParams, error) {
 	source := ui.sourceSelect.Selected
 	if source != sourceHuggingFace && source != sourceOllama {
 		return downloadParams{}, errors.New("выберите источник Hugging Face или Ollama")
+	}
+	// Ollama refs always have a name:tag form. Respect that explicit format even
+	// if the source selector was left at its default value.
+	if source == sourceHuggingFace && strings.Contains(model, ":") && !strings.Contains(model, "/") {
+		source = sourceOllama
+	}
+	if source == sourceOllama && strings.HasPrefix(strings.ToLower(model), "gpt-oss") {
+		return downloadParams{}, errors.New("gpt-oss пока не поддерживается: это архитектура не Llama/Mistral; выберите tinyllama:latest или модель семейства Llama")
 	}
 	return downloadParams{model: model, modelDir: modelDir, source: source}, nil
 }
