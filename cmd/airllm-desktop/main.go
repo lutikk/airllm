@@ -20,8 +20,11 @@ import (
 	"fyne.io/fyne/v2/widget"
 	"github.com/lutikk/airllm/internal/gguf"
 	"github.com/lutikk/airllm/internal/hub"
+	"github.com/lutikk/airllm/internal/model"
+	"github.com/lutikk/airllm/internal/model/gptoss"
 	"github.com/lutikk/airllm/internal/model/llama"
 	"github.com/lutikk/airllm/internal/ollama"
+	"github.com/lutikk/airllm/internal/tokenizer/harmony"
 	"github.com/lutikk/airllm/pkg/hardware"
 	"github.com/lutikk/airllm/pkg/memory"
 )
@@ -39,10 +42,10 @@ const (
 В поле «Модель» укажите ID в формате org/repo, например TinyLlama/TinyLlama-1.1B-Chat-v1.0. ID копируется со страницы модели на huggingface.co. Этот небольшой чат-пример подходит для первой проверки, но CPU reference всё равно работает медленно.
 
 Модель Ollama
-Выберите источник Ollama, укажите ссылку вроде tinyllama:latest и нажмите «Загрузить». AirLLM скачивает GGUF напрямую из Ollama registry: установленная Ollama, её daemon и API не нужны. Затем GGUF конвертируется в локальную модель AirLLM, а поле «Модель» автоматически получает её путь.
+Выберите источник Ollama, укажите ссылку вроде tinyllama:latest или gpt-oss:20b и нажмите «Загрузить». AirLLM скачивает GGUF напрямую из Ollama registry: установленная Ollama, её daemon и API не нужны. После загрузки определяется архитектура, а поле «Модель» автоматически получает готовый локальный путь.
 
 Поддерживаемые GGUF
-Конвертация поддерживает Llama-тензоры F32, F16, Q8_0, Q4_0, Q4_K, Q5_K и Q6_K. Результат содержит config.json, tokenizer.json и веса safetensors F16. Другие архитектуры, включая gpt-oss, пока не поддерживаются: выберите tinyllama:latest или Llama-совместимую модель.
+Llama конвертируется в safetensors F16 с config.json и tokenizer.json; поддерживаются тензоры F32, F16, Q8_0, Q4_0, Q4_K, Q5_K и Q6_K. GPT-OSS (gptoss/gpt-oss) запускается прямо из исходного model.gguf без конвертации весов: рядом создаётся o200k tokenizer.json, а запрос передаётся в минимальном Harmony-формате. Не выбирайте 120b без достаточного диска и памяти.
 
 Закрытые модели
 Если репозиторий gated или private, сначала получите доступ на его странице. Затем создайте токен в настройках Hugging Face и задайте переменную окружения HF_TOKEN до запуска AirLLM. Не вставляйте токен в поле модели.
@@ -51,7 +54,7 @@ const (
 В репозитории или локальной папке должны быть config.json, tokenizer.json и веса safetensors. Для разбитой модели нужны все части весов и model.safetensors.index.json, если он входит в репозиторий.
 
 Локальная модель
-Вместо HF ID можно указать полный путь к уже распакованной папке модели. В этом случае AirLLM ничего не скачивает.
+Вместо HF ID можно указать полный путь к папке safetensors или к GPT-OSS .gguf. Для GGUF рядом должен находиться tokenizer.json, созданный при загрузке. В этом случае AirLLM ничего не скачивает.
 
 Каталог загрузки и диск
 Файлы из Hugging Face сохраняются в выбранный каталог и используются повторно. Модели могут занимать от нескольких гигабайтов до десятков и сотен гигабайтов: заранее проверьте размер файлов на странице репозитория и свободное место. Кнопка «Выбрать» позволяет использовать другой диск; выбор сохраняется между запусками.`
@@ -311,9 +314,6 @@ func (ui *desktopUI) readDownloadParams() (downloadParams, error) {
 	if source == sourceHuggingFace && strings.Contains(model, ":") && !strings.Contains(model, "/") {
 		source = sourceOllama
 	}
-	if source == sourceOllama && strings.HasPrefix(strings.ToLower(model), "gpt-oss") {
-		return downloadParams{}, errors.New("gpt-oss пока не поддерживается: это архитектура не Llama/Mistral; выберите tinyllama:latest или модель семейства Llama")
-	}
 	return downloadParams{model: model, modelDir: modelDir, source: source}, nil
 }
 
@@ -430,17 +430,33 @@ func (ui *desktopUI) download(ctx context.Context, params downloadParams) (strin
 		if err != nil {
 			return "", fmt.Errorf("загрузка модели %s из Ollama registry: %w", params.model, err)
 		}
-		convertedDir := filepath.Join(pullDir, "airllm")
-		ui.setStatus("Конвертация GGUF в safetensors F16…")
-		fyne.Do(func() {
-			ui.progress.Min = 0
-			ui.progress.Max = 1
-			ui.progress.SetValue(0)
-		})
-		if err := gguf.Convert(ctx, filepath.Join(pullDir, "model.gguf"), convertedDir); err != nil {
-			return "", fmt.Errorf("конвертация GGUF: %w", err)
+		modelPath := filepath.Join(pullDir, "model.gguf")
+		architecture, err := gguf.Architecture(modelPath)
+		if err != nil {
+			return "", fmt.Errorf("определение архитектуры GGUF: %w", err)
 		}
-		return convertedDir, nil
+		switch architecture {
+		case "gptoss", "gpt-oss":
+			ui.setStatus("Подготовка GPT-OSS tokenizer.json без конвертации весов…")
+			if _, err := gguf.PrepareGPTOSSTokenizer(modelPath, pullDir); err != nil {
+				return "", fmt.Errorf("подготовка GPT-OSS tokenizer: %w", err)
+			}
+			return modelPath, nil
+		case "llama":
+			convertedDir := filepath.Join(pullDir, "airllm")
+			ui.setStatus("Конвертация GGUF в safetensors F16…")
+			fyne.Do(func() {
+				ui.progress.Min = 0
+				ui.progress.Max = 1
+				ui.progress.SetValue(0)
+			})
+			if err := gguf.Convert(ctx, modelPath, convertedDir); err != nil {
+				return "", fmt.Errorf("конвертация GGUF: %w", err)
+			}
+			return convertedDir, nil
+		default:
+			return "", fmt.Errorf("архитектура GGUF %q не поддерживается", architecture)
+		}
 	default:
 		return "", errors.New("неподдерживаемый источник модели")
 	}
@@ -476,23 +492,32 @@ func safeModelReference(reference string) string {
 }
 
 func (ui *desktopUI) generate(ctx context.Context, params runParams) (resultErr error) {
-	modelDir, err := resolveModelDir(ctx, params.model, params.modelDir)
+	modelPath, err := resolveModelDir(ctx, params.model, params.modelDir)
 	if err != nil {
 		return err
 	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	nativeGPTOSS := strings.EqualFold(filepath.Ext(modelPath), ".gguf")
 	ui.setStatus("Проверка лимита памяти…")
-	config, err := llama.LoadConfig(filepath.Join(modelDir, "config.json"))
+	var estimate memory.Estimate
+	if nativeGPTOSS {
+		estimate, err = gptoss.EstimateMemory(modelPath, params.contextLength)
+	} else {
+		var config llama.Config
+		config, err = llama.LoadConfig(filepath.Join(modelPath, "config.json"))
+		if err == nil {
+			var planner llama.LayerPlanner
+			planner, err = llama.NewLayerPlanner(config, 4)
+			if err == nil {
+				estimate = planner.Estimate(uint64(params.contextLength))
+			}
+		}
+	}
 	if err != nil {
 		return err
 	}
-	planner, err := llama.NewLayerPlanner(config, 4)
-	if err != nil {
-		return err
-	}
-	estimate := planner.Estimate(uint64(params.contextLength))
 	estimate.Workspace = workspaceBytes
 	plan := memory.Plan(memory.Budget{HostBytes: params.memoryLimit, DeviceBytes: params.memoryLimit}, estimate)
 	if !plan.Fits {
@@ -505,7 +530,12 @@ func (ui *desktopUI) generate(ctx context.Context, params runParams) (resultErr 
 	}
 
 	ui.setStatus("Загрузка модели и токенизатора (CPU reference)…")
-	modelRuntime, err := llama.Open(modelDir, params.contextLength)
+	var modelRuntime model.Runtime
+	if nativeGPTOSS {
+		modelRuntime, err = gptoss.Open(modelPath, params.contextLength)
+	} else {
+		modelRuntime, err = llama.Open(modelPath, params.contextLength)
+	}
 	if err != nil {
 		return err
 	}
@@ -515,7 +545,11 @@ func (ui *desktopUI) generate(ctx context.Context, params runParams) (resultErr 
 		}
 	}()
 
-	promptTokens, err := modelRuntime.Encode(params.prompt, true)
+	prompt := params.prompt
+	if nativeGPTOSS {
+		prompt = harmony.RenderPrompt(nil, prompt)
+	}
+	promptTokens, err := modelRuntime.Encode(prompt, !nativeGPTOSS)
 	if err != nil {
 		return err
 	}
@@ -537,9 +571,12 @@ func (ui *desktopUI) generate(ctx context.Context, params runParams) (resultErr 
 			return err
 		}
 		generatedTokens = append(generatedTokens, token)
-		decoded, err := modelRuntime.Decode(generatedTokens, true)
+		decoded, err := modelRuntime.Decode(generatedTokens, !nativeGPTOSS)
 		if err != nil {
 			return err
+		}
+		if nativeGPTOSS {
+			decoded = visibleHarmonyText(decoded)
 		}
 		delta := decoded
 		replaceOutput := false
@@ -547,8 +584,7 @@ func (ui *desktopUI) generate(ctx context.Context, params runParams) (resultErr 
 			delta = strings.TrimPrefix(decoded, decodedSoFar)
 			decodedSoFar = decoded
 		} else {
-			// A tokenizer may revise an earlier byte sequence. Re-render the complete
-			// answer instead of appending a malformed suffix.
+			// A tokenizer or Harmony parser may revise earlier output.
 			decodedSoFar = decoded
 			replaceOutput = true
 		}
@@ -568,6 +604,21 @@ func (ui *desktopUI) generate(ctx context.Context, params runParams) (resultErr 
 		})
 		return nil
 	})
+}
+
+func visibleHarmonyText(decoded string) string {
+	parser := harmony.NewParser(harmony.Options{})
+	events, err := parser.WriteText(decoded)
+	if err != nil {
+		return ""
+	}
+	var output strings.Builder
+	for _, event := range events {
+		if event.Type == harmony.EventText {
+			output.WriteString(event.Text)
+		}
+	}
+	return output.String()
 }
 
 func (ui *desktopUI) setStatus(status string) {
@@ -596,8 +647,8 @@ func savedModelDir(preferences fyne.Preferences) string {
 func resolveModelDir(ctx context.Context, model, downloadDir string) (string, error) {
 	info, err := os.Stat(model)
 	if err == nil {
-		if !info.IsDir() {
-			return "", fmt.Errorf("путь модели должен указывать на каталог: %s", model)
+		if !info.IsDir() && !strings.EqualFold(filepath.Ext(model), ".gguf") {
+			return "", fmt.Errorf("локальная модель должна быть каталогом safetensors или файлом .gguf: %s", model)
 		}
 		return model, nil
 	}

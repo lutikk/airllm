@@ -58,16 +58,36 @@ func (c *KVCache) Append(keys, values []float32, sequenceLength int) error {
 	return nil
 }
 
+// AttentionConfig contains optional per-layer attention behavior. A zero
+// SlidingWindow disables the window. Sinks contains one learned logit per query
+// head; each sink participates in softmax normalization but has no value vector.
+type AttentionConfig struct {
+	Sinks         []float32
+	SlidingWindow int
+}
+
 // CausalAttention computes scaled dot-product attention for the most recently
 // appended tokens. Query has shape [queryLength, numQueryHeads, headDim], and
 // output has the same shape. Each query attends to cached tokens up to its own
 // absolute position. The scale is 1/sqrt(headDim).
 func CausalAttention(query []float32, numQueryHeads int, cache *KVCache) ([]float32, error) {
+	return CausalAttentionWithConfig(query, numQueryHeads, cache, AttentionConfig{})
+}
+
+// CausalAttentionWithConfig computes causal attention with optional learned
+// sinks and a per-layer sliding window. The window includes the current token.
+func CausalAttentionWithConfig(query []float32, numQueryHeads int, cache *KVCache, config AttentionConfig) ([]float32, error) {
 	if cache == nil {
 		return nil, fmt.Errorf("attention cache must not be nil")
 	}
 	if numQueryHeads <= 0 || numQueryHeads%cache.numKVHeads != 0 {
 		return nil, fmt.Errorf("attention query heads %d must be a positive multiple of kv heads %d", numQueryHeads, cache.numKVHeads)
+	}
+	if len(config.Sinks) != 0 && len(config.Sinks) != numQueryHeads {
+		return nil, fmt.Errorf("attention sinks length %d, want %d", len(config.Sinks), numQueryHeads)
+	}
+	if config.SlidingWindow < 0 {
+		return nil, fmt.Errorf("attention sliding window must be non-negative: %d", config.SlidingWindow)
 	}
 	queryStride := numQueryHeads * cache.headDim
 	if len(query) == 0 || len(query)%queryStride != 0 {
@@ -87,13 +107,20 @@ func CausalAttention(query []float32, numQueryHeads int, cache *KVCache) ([]floa
 
 	for queryIndex := 0; queryIndex < queryLength; queryIndex++ {
 		position := firstQueryPosition + queryIndex
+		firstKeyPosition := 0
+		if config.SlidingWindow > 0 && position >= config.SlidingWindow {
+			firstKeyPosition = position - config.SlidingWindow + 1
+		}
 		for queryHead := 0; queryHead < numQueryHeads; queryHead++ {
 			kvHead := queryHead / headsPerKV
 			queryOffset := queryIndex*queryStride + queryHead*cache.headDim
 			q := query[queryOffset : queryOffset+cache.headDim]
 
 			maxScore := math.Inf(-1)
-			for keyPosition := 0; keyPosition <= position; keyPosition++ {
+			if len(config.Sinks) != 0 {
+				maxScore = float64(config.Sinks[queryHead])
+			}
+			for keyPosition := firstKeyPosition; keyPosition <= position; keyPosition++ {
 				keyOffset := keyPosition*kvStride + kvHead*cache.headDim
 				k := cache.keys[keyOffset : keyOffset+cache.headDim]
 				var dot float64
@@ -107,15 +134,18 @@ func CausalAttention(query []float32, numQueryHeads int, cache *KVCache) ([]floa
 			}
 
 			var denominator float64
-			for keyPosition := 0; keyPosition <= position; keyPosition++ {
+			for keyPosition := firstKeyPosition; keyPosition <= position; keyPosition++ {
 				scores[keyPosition] = math.Exp(scores[keyPosition] - maxScore)
 				denominator += scores[keyPosition]
+			}
+			if len(config.Sinks) != 0 {
+				denominator += math.Exp(float64(config.Sinks[queryHead]) - maxScore)
 			}
 
 			outOffset := queryOffset
 			for d := 0; d < cache.headDim; d++ {
 				var sum float64
-				for keyPosition := 0; keyPosition <= position; keyPosition++ {
+				for keyPosition := firstKeyPosition; keyPosition <= position; keyPosition++ {
 					valueOffset := keyPosition*kvStride + kvHead*cache.headDim + d
 					sum += scores[keyPosition] * float64(cache.values[valueOffset])
 				}

@@ -17,11 +17,19 @@ import (
 // Tokenizer is a Hugging Face tokenizer. It is safe to use after construction
 // without any Python or native tokenizer runtime.
 type Tokenizer struct {
-	inner *sugarme.Tokenizer
+	inner         *sugarme.Tokenizer
+	specialTokens []addedToken
+	manualSpecial bool
+}
+
+type addedToken struct {
+	content string
+	id      uint32
 }
 
 // NewFromFile loads a tokenizer.json file. The supported configuration covers
-// TinyLlama/Llama-style BPE, Metaspace, TemplateProcessing, and decoder chains.
+// Llama Metaspace and GPT-OSS ByteLevel BPE, o200k Split, TemplateProcessing,
+// added tokens, and decoder chains.
 func NewFromFile(path string) (*Tokenizer, error) {
 	config, err := sugarme.ConfigFromFile(path)
 	if err != nil {
@@ -62,6 +70,7 @@ func NewFromFile(path string) (*Tokenizer, error) {
 		inner.WithDecoder(decoderChain)
 	}
 
+	result := &Tokenizer{inner: inner, manualSpecial: config.PostProcessor == nil}
 	for _, token := range config.AddedTokens {
 		added := sugarme.NewAddedToken(token.Content, token.Special,
 			sugarme.WithSingleWord(token.SingleWord),
@@ -70,18 +79,31 @@ func NewFromFile(path string) (*Tokenizer, error) {
 			sugarme.WithNormalized(token.Normalized),
 		)
 		if token.Special {
+			if token.Id < 0 {
+				return nil, fmt.Errorf("invalid negative added-token ID %d", token.Id)
+			}
+			result.specialTokens = append(result.specialTokens, addedToken{content: token.Content, id: uint32(token.Id)})
 			inner.AddSpecialTokens([]sugarme.AddedToken{added})
 		} else {
 			inner.AddTokens([]sugarme.AddedToken{added})
 		}
 	}
-
-	return &Tokenizer{inner: inner}, nil
+	return result, nil
 }
 
 // Encode converts text to token IDs, optionally applying the tokenizer's
 // post-processor (for example, adding TinyLlama's BOS token).
 func (t *Tokenizer) Encode(text string, addSpecialTokens bool) ([]uint32, error) {
+	if t.manualSpecial && len(t.specialTokens) > 0 {
+		return t.encodeWithSpecialTokens(text)
+	}
+	return t.encodePlain(text, addSpecialTokens)
+}
+
+func (t *Tokenizer) encodePlain(text string, addSpecialTokens bool) ([]uint32, error) {
+	if text == "" {
+		return nil, nil
+	}
 	encoding, err := t.inner.EncodeSingle(text, addSpecialTokens)
 	if err != nil {
 		return nil, fmt.Errorf("encode text: %w", err)
@@ -94,6 +116,38 @@ func (t *Tokenizer) Encode(text string, addSpecialTokens bool) ([]uint32, error)
 		ids[i] = uint32(id)
 	}
 	return ids, nil
+}
+
+// encodeWithSpecialTokens avoids sugarme's ByteLevel pipeline, whose Normalize
+// method drops splits that already contain added tokens. Harmony control tokens
+// must survive encoding even without a post-processor.
+func (t *Tokenizer) encodeWithSpecialTokens(text string) ([]uint32, error) {
+	var result []uint32
+	for len(text) > 0 {
+		matchAt, matchLength := -1, 0
+		var matchID uint32
+		for _, token := range t.specialTokens {
+			at := strings.Index(text, token.content)
+			if at >= 0 && (matchAt < 0 || at < matchAt || at == matchAt && len(token.content) > matchLength) {
+				matchAt, matchLength, matchID = at, len(token.content), token.id
+			}
+		}
+		if matchAt < 0 {
+			ids, err := t.encodePlain(text, false)
+			if err != nil {
+				return nil, err
+			}
+			return append(result, ids...), nil
+		}
+		ids, err := t.encodePlain(text[:matchAt], false)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, ids...)
+		result = append(result, matchID)
+		text = text[matchAt+matchLength:]
+	}
+	return result, nil
 }
 
 // Decode converts token IDs back to text.
@@ -246,27 +300,85 @@ func newNormalizer(config map[string]interface{}) (normalizer.Normalizer, error)
 }
 
 func newPreTokenizer(config map[string]interface{}) (sugarme.PreTokenizer, error) {
-	if config["type"] != "Metaspace" {
+	switch config["type"] {
+	case "Sequence":
+		raw, ok := config["pretokenizers"].([]interface{})
+		if !ok {
+			return nil, fmt.Errorf("invalid pre-tokenizer sequence")
+		}
+		sequence := make(preTokenizerSequence, 0, len(raw))
+		for _, item := range raw {
+			value, ok := item.(map[string]interface{})
+			if !ok {
+				return nil, fmt.Errorf("invalid pre-tokenizer in sequence")
+			}
+			component, err := newPreTokenizer(value)
+			if err != nil {
+				return nil, err
+			}
+			sequence = append(sequence, component)
+		}
+		return sequence, nil
+	case "Split":
+		pattern, _ := config["pattern"].(map[string]interface{})
+		behavior := normalizer.SplitDelimiterBehavior(normalizer.IsolatedBehavior)
+		switch config["behavior"] {
+		case "removed":
+			behavior = normalizer.RemovedBehavior
+		case "isolated", nil:
+		case "merged_with_previous":
+			behavior = normalizer.MergedWithPreviousBehavior
+		case "merged_with_next":
+			behavior = normalizer.MergedWithNextBehavior
+		case "contiguous":
+			behavior = normalizer.ContiguousBehavior
+		default:
+			return nil, fmt.Errorf("unsupported Split behavior %q", config["behavior"])
+		}
+		invert, _ := config["invert"].(bool)
+		if value, ok := pattern["String"].(string); ok {
+			return pretokenizer.NewSplit(normalizer.NewStringPattern(value), behavior, invert), nil
+		}
+		if value, ok := pattern["Regex"].(string); ok {
+			return newO200KOrRegexpSplit(value, behavior, invert)
+		}
+		return nil, fmt.Errorf("unsupported Split pattern")
+	case "ByteLevel":
+		addPrefix, _ := config["add_prefix_space"].(bool)
+		trimOffsets, _ := config["trim_offsets"].(bool)
+		useRegex := true
+		if raw, ok := config["use_regex"].(bool); ok {
+			useRegex = raw
+		}
+		if !useRegex {
+			return byteLevelWithoutRegex{addPrefixSpace: addPrefix}, nil
+		}
+		byteLevel := pretokenizer.NewByteLevel()
+		byteLevel.SetAddPrefixSpace(addPrefix)
+		byteLevel.SetTrimOffsets(trimOffsets)
+		return byteLevel, nil
+	case "Metaspace":
+		replacement, _ := config["replacement"].(string)
+		if replacement == "" {
+			replacement = "▁"
+		}
+		scheme := pretokenizer.Never
+		switch config["prepend_scheme"] {
+		case "always":
+			scheme = pretokenizer.Always
+		case "first":
+			scheme = pretokenizer.First
+		case "never", nil:
+			if addPrefix, _ := config["add_prefix_space"].(bool); addPrefix {
+				scheme = pretokenizer.Always
+			}
+		default:
+			return nil, fmt.Errorf("unsupported Metaspace prepend scheme %q", config["prepend_scheme"])
+		}
+		return pretokenizer.NewMetaspaceWithScheme(replacement, scheme), nil
+	default:
 		return nil, fmt.Errorf("unsupported pre-tokenizer type %q", config["type"])
 	}
-	replacement, _ := config["replacement"].(string)
-	if replacement == "" {
-		replacement = "▁"
-	}
-	scheme := pretokenizer.Never
-	switch config["prepend_scheme"] {
-	case "always":
-		scheme = pretokenizer.Always
-	case "first":
-		scheme = pretokenizer.First
-	case "never", nil:
-		if addPrefix, _ := config["add_prefix_space"].(bool); addPrefix {
-			scheme = pretokenizer.Always
-		}
-	default:
-		return nil, fmt.Errorf("unsupported Metaspace prepend scheme %q", config["prepend_scheme"])
-	}
-	return pretokenizer.NewMetaspaceWithScheme(replacement, scheme), nil
 }
 
 func newPostProcessor(config map[string]interface{}) (sugarme.PostProcessor, error) {
@@ -369,6 +481,13 @@ func newDecoder(config map[string]interface{}) (sugarme.Decoder, error) {
 		return &replaceDecoder{old: value, new: content}, nil
 	case "ByteFallback":
 		return decoder.NewByteFallback(), nil
+	case "ByteLevel":
+		byteLevel := pretokenizer.NewByteLevel()
+		addPrefix, _ := config["add_prefix_space"].(bool)
+		trimOffsets, _ := config["trim_offsets"].(bool)
+		byteLevel.SetAddPrefixSpace(addPrefix)
+		byteLevel.SetTrimOffsets(trimOffsets)
+		return byteLevel, nil
 	case "Fuse":
 		return decoder.NewFuse(), nil
 	case "Strip":

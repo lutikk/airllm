@@ -1,6 +1,9 @@
 package main
 
 import (
+	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -43,10 +46,11 @@ func TestReadDownloadParams(t *testing.T) {
 		t.Fatalf("name:tag should select Ollama automatically: %+v, %v", params, err)
 	}
 
-	ui.modelEntry.SetText("gpt-oss:120b")
+	ui.modelEntry.SetText("gpt-oss:20b")
 	ui.sourceSelect.SetSelected(sourceOllama)
-	if _, err := ui.readDownloadParams(); err == nil || !strings.Contains(err.Error(), "не поддерживается") {
-		t.Fatalf("gpt-oss should be rejected before downloading: %v", err)
+	params, err = ui.readDownloadParams()
+	if err != nil || params.model != "gpt-oss:20b" {
+		t.Fatalf("gpt-oss should be accepted: %+v, %v", params, err)
 	}
 
 	ui.sourceSelect.Selected = ""
@@ -73,5 +77,24 @@ func TestHardwareSummaryIncludesCPULimitation(t *testing.T) {
 		if !strings.Contains(summary, expected) {
 			t.Errorf("hardware summary %q does not contain %q", summary, expected)
 		}
+	}
+}
+
+func TestResolveModelDirAcceptsGGUF(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "model.gguf")
+	if err := os.WriteFile(path, []byte("GGUF"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := resolveModelDir(context.Background(), path, "")
+	if err != nil || got != path {
+		t.Fatalf("resolveModelDir() = %q, %v; want %q", got, err, path)
+	}
+}
+
+func TestVisibleHarmonyText(t *testing.T) {
+	decoded := "<|start|>assistant<|channel|>analysis<|message|>hidden<|end|>" +
+		"<|start|>assistant<|channel|>final<|message|>visible answer<|return|>"
+	if got := visibleHarmonyText(decoded); got != "visible answer" {
+		t.Fatalf("visibleHarmonyText() = %q", got)
 	}
 }

@@ -15,8 +15,8 @@ import (
 	"strings"
 )
 
-// Convert converts a Llama GGUF file into config.json, tokenizer.json, and one
-// F16 model.safetensors file. Only one source tensor is held in memory at a
+// Convert converts a supported GGUF file into config.json, tokenizer.json, and
+// one F16 model.safetensors file. Only one source tensor is held in memory at a
 // time; no model-wide weight buffer is allocated.
 func Convert(ctx context.Context, ggufPath, destDir string) (returnErr error) {
 	if err := ctx.Err(); err != nil {
@@ -32,6 +32,21 @@ func Convert(ctx context.Context, ggufPath, destDir string) (returnErr error) {
 		}
 	}()
 
+	architecture, err := metadataString(reader.metadata, "general.architecture")
+	if err != nil {
+		return err
+	}
+	switch architecture {
+	case "llama":
+		return convertLlama(ctx, reader, destDir)
+	case "gptoss", "gpt-oss":
+		return convertGPTOSS(ctx, reader, destDir)
+	default:
+		return fmt.Errorf("gguf: unsupported architecture %q", architecture)
+	}
+}
+
+func convertLlama(ctx context.Context, reader *Reader, destDir string) error {
 	metadata, err := reader.LlamaMetadata()
 	if err != nil {
 		return err
@@ -346,6 +361,18 @@ func writeF16Tensor(ctx context.Context, destination io.Writer, tensor TensorInf
 				return err
 			}
 		}
+	case BF16:
+		for offset := 0; offset < len(source); offset += 2 {
+			if offset%(64*1024) == 0 {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+			}
+			value := math.Float32frombits(uint32(binary.LittleEndian.Uint16(source[offset:])) << 16)
+			if err := appendFloat(value); err != nil {
+				return err
+			}
+		}
 	case F32:
 		for offset := 0; offset < len(source); offset += 4 {
 			if offset%(64*1024) == 0 {
@@ -355,6 +382,15 @@ func writeF16Tensor(ctx context.Context, destination io.Writer, tensor TensorInf
 			}
 			value := math.Float32frombits(binary.LittleEndian.Uint32(source[offset:]))
 			if err := appendFloat(value); err != nil {
+				return err
+			}
+		}
+	case MXFP4:
+		for offset := 0; offset < len(source); offset += 17 {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			if err := appendMXFP4Block(source[offset:offset+17], appendFloat); err != nil {
 				return err
 			}
 		}
@@ -412,6 +448,28 @@ func writeF16Tensor(ctx context.Context, destination io.Writer, tensor TensorInf
 		return fmt.Errorf("gguf: tensor %q has unsupported type %s", tensor.Name, tensor.Type)
 	}
 	return flush()
+}
+
+var mxfp4Values = [16]float32{
+	0, 0.5, 1, 1.5, 2, 3, 4, 6,
+	float32(math.Copysign(0, -1)), -0.5, -1, -1.5, -2, -3, -4, -6,
+}
+
+func appendMXFP4Block(block []byte, appendValue func(float32) error) error {
+	// E8M0 is an unsigned exponent with a 127 bias. 0xff denotes NaN.
+	scale := float32(math.Ldexp(1, int(block[0])-127))
+	if block[0] == 0xff {
+		scale = float32(math.NaN())
+	}
+	for _, packed := range block[1:17] {
+		if err := appendValue(scale * mxfp4Values[packed&0x0f]); err != nil {
+			return err
+		}
+		if err := appendValue(scale * mxfp4Values[packed>>4]); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func appendQ6KBlock(block []byte, appendValue func(float32) error) error {

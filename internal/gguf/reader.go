@@ -15,13 +15,15 @@ import (
 type TensorType uint32
 
 const (
-	F32  TensorType = 0
-	F16  TensorType = 1
-	Q4_0 TensorType = 2
-	Q8_0 TensorType = 8
-	Q4_K TensorType = 12
-	Q5_K TensorType = 13
-	Q6_K TensorType = 14
+	F32   TensorType = 0
+	F16   TensorType = 1
+	Q4_0  TensorType = 2
+	Q8_0  TensorType = 8
+	Q4_K  TensorType = 12
+	Q5_K  TensorType = 13
+	Q6_K  TensorType = 14
+	BF16  TensorType = 30
+	MXFP4 TensorType = 39
 )
 
 func (t TensorType) String() string {
@@ -40,6 +42,10 @@ func (t TensorType) String() string {
 		return "Q5_K"
 	case Q6_K:
 		return "Q6_K"
+	case BF16:
+		return "BF16"
+	case MXFP4:
+		return "MXFP4"
 	default:
 		return fmt.Sprintf("GGUF_TYPE_%d", uint32(t))
 	}
@@ -94,6 +100,20 @@ func (r *Reader) Metadata() map[string]any {
 		result[key] = value
 	}
 	return result
+}
+
+// Architecture reads general.architecture without loading tensor data.
+func Architecture(path string) (_ string, returnErr error) {
+	reader, err := Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer func() {
+		if closeErr := reader.Close(); returnErr == nil && closeErr != nil {
+			returnErr = fmt.Errorf("gguf: close input: %w", closeErr)
+		}
+	}()
+	return metadataString(reader.metadata, "general.architecture")
 }
 
 // Tensors returns the tensor index sorted by name. Shapes are copies.
@@ -357,11 +377,19 @@ func encodedSize(tensorType TensorType, shape []uint64) (int64, error) {
 			return 0, errors.New("encoded tensor size overflows int64")
 		}
 		size = elements * 4
-	case F16:
+	case F16, BF16:
 		if elements > math.MaxInt64/2 {
 			return 0, errors.New("encoded tensor size overflows int64")
 		}
 		size = elements * 2
+	case MXFP4:
+		if elements%32 != 0 {
+			return 0, errors.New("MXFP4 element count must be divisible by 32")
+		}
+		if elements/32 > math.MaxInt64/17 {
+			return 0, errors.New("encoded tensor size overflows int64")
+		}
+		size = elements / 32 * 17
 	case Q8_0:
 		if elements%32 != 0 {
 			return 0, errors.New("Q8_0 element count must be divisible by 32")

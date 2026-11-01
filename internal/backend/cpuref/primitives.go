@@ -31,6 +31,21 @@ func Linear(input, weight []float32, inDim, outDim int) ([]float32, error) {
 	return output, nil
 }
 
+// LinearBias computes input * weight^T + bias. Weight has shape [outDim, inDim].
+func LinearBias(input, weight, bias []float32, inDim, outDim int) ([]float32, error) {
+	if len(bias) != outDim {
+		return nil, fmt.Errorf("linear bias length %d, want %d", len(bias), outDim)
+	}
+	output, err := Linear(input, weight, inDim, outDim)
+	if err != nil {
+		return nil, err
+	}
+	for i := range output {
+		output[i] += bias[i]
+	}
+	return output, nil
+}
+
 // RMSNorm normalizes input over its full length and applies a per-element weight.
 func RMSNorm(input, weight []float32, epsilon float32) ([]float32, error) {
 	if len(input) == 0 {
@@ -87,6 +102,21 @@ func SiLUGate(gate, up []float32) ([]float32, error) {
 	for i, value := range gate {
 		x := float64(value)
 		output[i] = float32(x/(1+math.Exp(-x))) * up[i]
+	}
+	return output, nil
+}
+
+// GPTOSSSwiGLU clamps gate above at 7 and up to [-7, 7], then computes
+// gate * sigmoid(1.702*gate) * (up + 1).
+func GPTOSSSwiGLU(gate, up []float32) ([]float32, error) {
+	if len(gate) != len(up) {
+		return nil, fmt.Errorf("gpt-oss swiglu lengths differ: %d and %d", len(gate), len(up))
+	}
+	output := make([]float32, len(gate))
+	for i := range gate {
+		g := math.Min(float64(gate[i]), 7)
+		u := math.Max(-7, math.Min(7, float64(up[i])))
+		output[i] = float32(g / (1 + math.Exp(-1.702*g)) * (u + 1))
 	}
 	return output, nil
 }
