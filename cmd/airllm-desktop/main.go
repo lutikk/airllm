@@ -63,6 +63,7 @@ Llama конвертируется в safetensors F16 с config.json и tokenize
 type runParams struct {
 	model         string
 	modelDir      string
+	source        string
 	prompt        string
 	memoryLimit   uint64
 	contextLength int
@@ -350,9 +351,17 @@ func (ui *desktopUI) readParams() (runParams, error) {
 	if err != nil || maxTokens < 0 {
 		return runParams{}, errors.New("максимум токенов должен быть целым неотрицательным числом")
 	}
+	source := ui.sourceSelect.Selected
+	if source == sourceHuggingFace && strings.Contains(model, ":") && !strings.Contains(model, "/") {
+		source = sourceOllama
+	}
+	if source != sourceHuggingFace && source != sourceOllama {
+		return runParams{}, errors.New("выберите источник Hugging Face или Ollama")
+	}
 	return runParams{
 		model:         model,
 		modelDir:      modelDir,
+		source:        source,
 		prompt:        ui.promptEntry.Text,
 		memoryLimit:   memoryLimit,
 		contextLength: contextLength,
@@ -506,10 +515,20 @@ func safeModelReference(reference string) string {
 }
 
 func (ui *desktopUI) generate(ctx context.Context, params runParams) (resultErr error) {
-	modelPath, err := resolveModelDir(ctx, params.model, params.modelDir)
-	if err != nil {
-		return err
+	modelPath := params.model
+	info, statErr := os.Stat(modelPath)
+	if statErr != nil {
+		var err error
+		modelPath, err = ui.download(ctx, downloadParams{
+			model: params.model, modelDir: params.modelDir, source: params.source,
+		})
+		if err != nil {
+			return err
+		}
+	} else if !info.IsDir() && !strings.EqualFold(filepath.Ext(modelPath), ".gguf") {
+		return fmt.Errorf("путь модели должен указывать на каталог или GGUF-файл: %s", modelPath)
 	}
+	var err error
 	if err := ctx.Err(); err != nil {
 		return err
 	}
