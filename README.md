@@ -1,5 +1,20 @@
 ![airllm_logo](https://github.com/lyogavin/airllm/blob/main/assets/airllm_logo_sm.png?v=3&raw=true)
 
+## Native Go port (`go-port` branch)
+
+This fork is being rebuilt as a native, cross-platform Go application. The runtime reads original safetensors shards on demand instead of unpacking an entire model into RAM. The current foundation includes hardware detection, explicit memory budgets, Llama/Mistral configuration validation, and single- or multi-shard model inspection.
+
+```sh
+go build -o bin/airllm ./cmd/airllm
+
+./bin/airllm doctor
+./bin/airllm inspect /path/to/model --context=2048 --limit=4GiB
+./bin/airllm inspect /path/to/model.safetensors
+```
+
+The inference engine, MLX/Metal backend, and desktop interface are under active development. The Python implementation below remains available as the upstream reference.
+
+
 [**Quickstart**](#quickstart) | 
 [**Configurations**](#configurations) | 
 [**MacOS**](#macos) | 
