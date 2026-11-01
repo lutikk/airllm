@@ -77,7 +77,7 @@ func TestLoadConfigRejectsInvalidConfigs(t *testing.T) {
 		new     string
 		wantErr string
 	}{
-		{"unsupported architecture", "LlamaForCausalLM", "Qwen2ForCausalLM", "unsupported architectures"},
+		{"unsupported architecture", "LlamaForCausalLM", "Qwen3ForCausalLM", "unsupported architectures"},
 		{"missing layers", `"num_hidden_layers": 22`, `"num_hidden_layers": 0`, "num_hidden_layers"},
 		{"negative dimensions", `"hidden_size": 2048`, `"hidden_size": -2048`, "hidden_size"},
 		{"indivisible attention heads", `"num_attention_heads": 32`, `"num_attention_heads": 30`, "divisible"},

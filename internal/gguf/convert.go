@@ -37,7 +37,7 @@ func Convert(ctx context.Context, ggufPath, destDir string) (returnErr error) {
 		return err
 	}
 	switch architecture {
-	case "llama":
+	case "llama", "qwen2", "gemma", "gemma2":
 		return convertLlama(ctx, reader, destDir)
 	case "gptoss", "gpt-oss":
 		return convertGPTOSS(ctx, reader, destDir)
@@ -55,11 +55,14 @@ func convertLlama(ctx context.Context, reader *Reader, destDir string) error {
 	if err != nil {
 		return err
 	}
-	unknownID, err := unknownTokenID(reader.metadata, tokens)
-	if err != nil {
-		return err
+	unknownID := 0
+	if metadata.Architecture != "qwen2" {
+		unknownID, err = unknownTokenID(reader.metadata, tokens)
+		if err != nil {
+			return err
+		}
 	}
-	tensors, tied, err := mapTensors(reader.Tensors())
+	tensors, tied, err := mapTensors(reader.Tensors(), metadata.Architecture)
 	if err != nil {
 		return err
 	}
@@ -73,9 +76,13 @@ func convertLlama(ctx context.Context, reader *Reader, destDir string) error {
 	if err := writeSafetensors(ctx, reader, tensors, filepath.Join(destDir, "model.safetensors")); err != nil {
 		return err
 	}
+	hfArchitecture := map[string]string{
+		"llama": "LlamaForCausalLM", "qwen2": "Qwen2ForCausalLM",
+		"gemma": "GemmaForCausalLM", "gemma2": "Gemma2ForCausalLM",
+	}[metadata.Architecture]
 	config := map[string]any{
-		"architectures":           []string{"LlamaForCausalLM"},
-		"model_type":              "llama",
+		"architectures":           []string{hfArchitecture},
+		"model_type":              metadata.Architecture,
 		"hidden_size":             metadata.HiddenSize,
 		"intermediate_size":       metadata.IntermediateSize,
 		"num_attention_heads":     metadata.NumHeads,
@@ -84,8 +91,13 @@ func convertLlama(ctx context.Context, reader *Reader, destDir string) error {
 		"vocab_size":              metadata.VocabSize,
 		"rms_norm_eps":            metadata.RMSNormEpsilon,
 		"rope_theta":              metadata.RoPETheta,
-		"head_dim":                metadata.HiddenSize / metadata.NumHeads,
+		"head_dim":                metadata.HeadDim,
 		"max_position_embeddings": metadata.ContextLength,
+		"sliding_window":          metadata.SlidingWindow,
+		"sliding_window_pattern":  metadata.SlidingWindowPattern,
+		"query_pre_attn_scalar":   metadata.QueryPreAttentionScalar,
+		"attn_logit_softcapping":  metadata.AttnLogitSoftcapping,
+		"final_logit_softcapping": metadata.FinalLogitSoftcapping,
 		"tie_word_embeddings":     tied,
 		"bos_token_id":            metadata.BOSTokenID,
 		"eos_token_id":            metadata.EOSTokenID,
@@ -93,7 +105,12 @@ func convertLlama(ctx context.Context, reader *Reader, destDir string) error {
 	if err := writeJSONAtomic(filepath.Join(destDir, "config.json"), config); err != nil {
 		return err
 	}
-	tokenizer := buildTokenizer(tokens, merges, int(metadata.BOSTokenID), int(metadata.EOSTokenID), unknownID)
+	var tokenizer map[string]any
+	if metadata.Architecture == "qwen2" {
+		tokenizer = buildGPT2Tokenizer(tokens, merges, int(metadata.EOSTokenID), reader.metadata)
+	} else {
+		tokenizer = buildTokenizer(tokens, merges, int(metadata.BOSTokenID), int(metadata.EOSTokenID), unknownID)
+	}
 	if err := writeJSONAtomic(filepath.Join(destDir, "tokenizer.json"), tokenizer); err != nil {
 		return err
 	}
@@ -107,7 +124,11 @@ type convertedTensor struct {
 	size   int64
 }
 
-func mapTensors(source []TensorInfo) ([]convertedTensor, bool, error) {
+func mapTensors(source []TensorInfo, architecture ...string) ([]convertedTensor, bool, error) {
+	arch := ""
+	if len(architecture) != 0 {
+		arch = architecture[0]
+	}
 	result := make([]convertedTensor, 0, len(source))
 	seen := make(map[string]string)
 	hasOutput := false
@@ -116,6 +137,9 @@ func mapTensors(source []TensorInfo) ([]convertedTensor, bool, error) {
 			continue
 		}
 		name, ok := hfTensorName(tensor.Name)
+		if arch == "gemma2" && strings.HasSuffix(tensor.Name, ".ffn_norm.weight") {
+			name = strings.Replace(name, ".post_attention_layernorm.", ".pre_feedforward_layernorm.", 1)
+		}
 		if !ok {
 			return nil, false, fmt.Errorf("gguf: no Llama Hugging Face mapping for tensor %q", tensor.Name)
 		}
@@ -160,27 +184,33 @@ func hfTensorName(name string) (string, bool) {
 		return "", false
 	}
 	parts := strings.Split(name, ".")
-	if len(parts) != 4 || parts[0] != "blk" || parts[3] != "weight" {
+	if len(parts) != 4 || parts[0] != "blk" || (parts[3] != "weight" && parts[3] != "bias") {
+		return "", false
+	}
+	if parts[3] == "bias" && parts[2] != "attn_q" && parts[2] != "attn_k" && parts[2] != "attn_v" {
 		return "", false
 	}
 	if _, err := strconv.ParseUint(parts[1], 10, 31); err != nil {
 		return "", false
 	}
 	mappedName, ok := map[string]string{
-		"attn_norm":   "input_layernorm",
-		"attn_q":      "self_attn.q_proj",
-		"attn_k":      "self_attn.k_proj",
-		"attn_v":      "self_attn.v_proj",
-		"attn_output": "self_attn.o_proj",
-		"ffn_norm":    "post_attention_layernorm",
-		"ffn_gate":    "mlp.gate_proj",
-		"ffn_up":      "mlp.up_proj",
-		"ffn_down":    "mlp.down_proj",
+		"attn_norm":      "input_layernorm",
+		"attn_post_norm": "post_attention_layernorm",
+		"attn_q":         "self_attn.q_proj",
+		"attn_k":         "self_attn.k_proj",
+		"attn_v":         "self_attn.v_proj",
+		"attn_output":    "self_attn.o_proj",
+		"ffn_norm":       "post_attention_layernorm",
+		"ffn_pre_norm":   "pre_feedforward_layernorm",
+		"ffn_post_norm":  "post_feedforward_layernorm",
+		"ffn_gate":       "mlp.gate_proj",
+		"ffn_up":         "mlp.up_proj",
+		"ffn_down":       "mlp.down_proj",
 	}[parts[2]]
 	if !ok {
 		return "", false
 	}
-	return "model.layers." + parts[1] + "." + mappedName + ".weight", true
+	return "model.layers." + parts[1] + "." + mappedName + "." + parts[3], true
 }
 
 func validateConvertedShapes(tensors []convertedTensor, metadata LlamaMetadata, tied bool) error {
@@ -192,25 +222,54 @@ func validateConvertedShapes(tensors []convertedTensor, metadata LlamaMetadata, 
 		expected["lm_head.weight"] = []int64{int64(metadata.VocabSize), int64(metadata.HiddenSize)}
 	}
 	hidden := int64(metadata.HiddenSize)
-	kvWidth := int64(metadata.NumKVHeads * (metadata.HiddenSize / metadata.NumHeads))
+	headDim := metadata.HeadDim
+	if headDim == 0 {
+		headDim = metadata.HiddenSize / metadata.NumHeads
+	}
+	queryWidth := int64(metadata.NumHeads * headDim)
+	kvWidth := int64(metadata.NumKVHeads * headDim)
 	intermediate := int64(metadata.IntermediateSize)
 	for layer := 0; layer < metadata.NumLayers; layer++ {
 		prefix := fmt.Sprintf("model.layers.%d.", layer)
-		expected[prefix+"self_attn.q_proj.weight"] = []int64{hidden, hidden}
+		expected[prefix+"self_attn.q_proj.weight"] = []int64{queryWidth, hidden}
 		expected[prefix+"self_attn.k_proj.weight"] = []int64{kvWidth, hidden}
 		expected[prefix+"self_attn.v_proj.weight"] = []int64{kvWidth, hidden}
-		expected[prefix+"self_attn.o_proj.weight"] = []int64{hidden, hidden}
+		if metadata.Architecture == "qwen2" {
+			expected[prefix+"self_attn.q_proj.bias"] = []int64{hidden}
+			expected[prefix+"self_attn.k_proj.bias"] = []int64{kvWidth}
+			expected[prefix+"self_attn.v_proj.bias"] = []int64{kvWidth}
+		}
+		expected[prefix+"self_attn.o_proj.weight"] = []int64{hidden, queryWidth}
 		expected[prefix+"mlp.gate_proj.weight"] = []int64{intermediate, hidden}
 		expected[prefix+"mlp.up_proj.weight"] = []int64{intermediate, hidden}
 		expected[prefix+"mlp.down_proj.weight"] = []int64{hidden, intermediate}
 		expected[prefix+"input_layernorm.weight"] = []int64{hidden}
-		expected[prefix+"post_attention_layernorm.weight"] = []int64{hidden}
+		if metadata.Architecture == "gemma2" {
+			expected[prefix+"post_attention_layernorm.weight"] = []int64{hidden}
+			expected[prefix+"pre_feedforward_layernorm.weight"] = []int64{hidden}
+			expected[prefix+"post_feedforward_layernorm.weight"] = []int64{hidden}
+		} else {
+			expected[prefix+"post_attention_layernorm.weight"] = []int64{hidden}
+		}
 	}
 	actual := make(map[string][]int64, len(tensors))
 	for _, tensor := range tensors {
 		actual[tensor.name] = tensor.shape
 	}
-	for name, shape := range expected {
+	expectedNames := make([]string, 0, len(expected))
+	for name := range expected {
+		expectedNames = append(expectedNames, name)
+	}
+	sort.Slice(expectedNames, func(i, j int) bool {
+		iQBias := strings.HasSuffix(expectedNames[i], "self_attn.q_proj.bias")
+		jQBias := strings.HasSuffix(expectedNames[j], "self_attn.q_proj.bias")
+		if iQBias != jQBias {
+			return iQBias
+		}
+		return expectedNames[i] < expectedNames[j]
+	})
+	for _, name := range expectedNames {
+		shape := expected[name]
 		got, ok := actual[name]
 		if !ok {
 			return fmt.Errorf("gguf: required tensor %q is missing", name)

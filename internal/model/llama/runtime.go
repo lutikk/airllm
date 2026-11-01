@@ -3,6 +3,7 @@ package llama
 import (
 	"context"
 	"fmt"
+	"math"
 	"path/filepath"
 	"sync"
 
@@ -214,17 +215,35 @@ func (r *Runtime) embedSequence(tokens []uint32) []float32 {
 		start := int(token) * r.config.HiddenSize
 		copy(hidden[i*r.config.HiddenSize:(i+1)*r.config.HiddenSize], r.embeddings[start:start+r.config.HiddenSize])
 	}
+	if r.config.IsGemma() {
+		scale := float32(math.Sqrt(float64(r.config.HiddenSize)))
+		for i := range hidden {
+			hidden[i] *= scale
+		}
+	}
 	return hidden
 }
 
 func (r *Runtime) nextToken(hidden []float32) (uint32, error) {
-	normalized, err := cpuref.RMSNorm(hidden, r.finalNorm, float32(r.config.RMSNormEps))
+	var normalized []float32
+	var err error
+	if r.config.IsGemma() {
+		normalized, err = cpuref.RMSNormPlusOne(hidden, r.finalNorm, float32(r.config.RMSNormEps))
+	} else {
+		normalized, err = cpuref.RMSNorm(hidden, r.finalNorm, float32(r.config.RMSNormEps))
+	}
 	if err != nil {
 		return 0, fmt.Errorf("llama: final norm: %w", err)
 	}
 	logits, err := cpuref.Linear(normalized, r.lmHead, r.config.HiddenSize, r.config.VocabSize)
 	if err != nil {
 		return 0, fmt.Errorf("llama: lm head: %w", err)
+	}
+	if r.config.FinalLogitSoftcapping > 0 {
+		cap := r.config.FinalLogitSoftcapping
+		for i, logit := range logits {
+			logits[i] = float32(cap * math.Tanh(float64(logit)/cap))
+		}
 	}
 	best := 0
 	for i := 1; i < len(logits); i++ {

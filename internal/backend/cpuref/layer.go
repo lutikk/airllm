@@ -7,22 +7,30 @@ import (
 
 // LayerConfig describes the dimensions of a Llama-style decoder layer.
 type LayerConfig struct {
-	HiddenSize       int
-	IntermediateSize int
-	NumQueryHeads    int
-	NumKVHeads       int
-	HeadDim          int
-	NormEpsilon      float32
-	RoPETheta        float64
+	HiddenSize              int
+	IntermediateSize        int
+	NumQueryHeads           int
+	NumKVHeads              int
+	HeadDim                 int
+	NormEpsilon             float32
+	RoPETheta               float64
+	NormWeightPlusOne       bool
+	Gemma2                  bool
+	QueryPreAttentionScalar float64
+	AttentionLogitSoftcap   float64
+	SlidingWindow           int
 }
 
 // LayerWeights contains all projections and RMSNorm gains for a decoder layer.
 // Projection matrices are row-major [outDim, inDim]. Norm1 precedes attention;
 // Norm2 precedes the gated MLP.
 type LayerWeights struct {
-	Q, K, V, O     []float32
-	Gate, Up, Down []float32
-	Norm1, Norm2   []float32
+	Q, K, V, O          []float32
+	QBias, KBias, VBias []float32
+	Gate, Up, Down      []float32
+	Norm1, Norm2        []float32
+	PostAttentionNorm   []float32
+	PostFeedForwardNorm []float32
 }
 
 // DecoderLayer is a pure-Go reference implementation of one decoder block.
@@ -65,19 +73,19 @@ func (l DecoderLayer) forward(input []float32, sequenceLength int, cache *KVCach
 	values := make([]float32, sequenceLength*kvWidth)
 	for token := 0; token < sequenceLength; token++ {
 		hidden := input[token*config.HiddenSize : (token+1)*config.HiddenSize]
-		normalized, err := RMSNorm(hidden, weights.Norm1, config.NormEpsilon)
+		normalized, err := l.rmsNorm(hidden, weights.Norm1)
 		if err != nil {
 			return nil, err
 		}
-		q, err := Linear(normalized, weights.Q, config.HiddenSize, queryWidth)
+		q, err := linearOptionalBias(normalized, weights.Q, weights.QBias, config.HiddenSize, queryWidth)
 		if err != nil {
 			return nil, err
 		}
-		k, err := Linear(normalized, weights.K, config.HiddenSize, kvWidth)
+		k, err := linearOptionalBias(normalized, weights.K, weights.KBias, config.HiddenSize, kvWidth)
 		if err != nil {
 			return nil, err
 		}
-		v, err := Linear(normalized, weights.V, config.HiddenSize, kvWidth)
+		v, err := linearOptionalBias(normalized, weights.V, weights.VBias, config.HiddenSize, kvWidth)
 		if err != nil {
 			return nil, err
 		}
@@ -98,12 +106,16 @@ func (l DecoderLayer) forward(input []float32, sequenceLength int, cache *KVCach
 	if err := cache.Append(keys, values, sequenceLength); err != nil {
 		return nil, err
 	}
-	attention, err := CausalAttention(queries, config.NumQueryHeads, cache)
+	attention, err := CausalAttentionWithConfig(queries, config.NumQueryHeads, cache, AttentionConfig{
+		SlidingWindow:           config.SlidingWindow,
+		QueryPreAttentionScalar: config.QueryPreAttentionScalar,
+		LogitSoftcap:            config.AttentionLogitSoftcap,
+	})
 	if err != nil {
 		return nil, err
 	}
 
-	// Attention output projection and the first residual connection.
+	// Gemma2 normalizes attention and MLP outputs before adding residuals.
 	residual := make([]float32, len(input))
 	for token := 0; token < sequenceLength; token++ {
 		attentionRow := attention[token*queryWidth : (token+1)*queryWidth]
@@ -111,16 +123,21 @@ func (l DecoderLayer) forward(input []float32, sequenceLength int, cache *KVCach
 		if err != nil {
 			return nil, err
 		}
+		if config.Gemma2 {
+			projected, err = l.rmsNorm(projected, weights.PostAttentionNorm)
+			if err != nil {
+				return nil, err
+			}
+		}
 		for i := 0; i < config.HiddenSize; i++ {
 			residual[token*config.HiddenSize+i] = input[token*config.HiddenSize+i] + projected[i]
 		}
 	}
 
-	// SiLU-gated MLP and the second residual connection.
 	output := make([]float32, len(input))
 	for token := 0; token < sequenceLength; token++ {
 		residualRow := residual[token*config.HiddenSize : (token+1)*config.HiddenSize]
-		normalized, err := RMSNorm(residualRow, weights.Norm2, config.NormEpsilon)
+		normalized, err := l.rmsNorm(residualRow, weights.Norm2)
 		if err != nil {
 			return nil, err
 		}
@@ -132,13 +149,24 @@ func (l DecoderLayer) forward(input []float32, sequenceLength int, cache *KVCach
 		if err != nil {
 			return nil, err
 		}
-		activated, err := SiLUGate(gate, up)
+		var activated []float32
+		if config.NormWeightPlusOne {
+			activated, err = ApproximateGELUGate(gate, up)
+		} else {
+			activated, err = SiLUGate(gate, up)
+		}
 		if err != nil {
 			return nil, err
 		}
 		down, err := Linear(activated, weights.Down, config.IntermediateSize, config.HiddenSize)
 		if err != nil {
 			return nil, err
+		}
+		if config.Gemma2 {
+			down, err = l.rmsNorm(down, weights.PostFeedForwardNorm)
+			if err != nil {
+				return nil, err
+			}
 		}
 		for i := 0; i < config.HiddenSize; i++ {
 			output[token*config.HiddenSize+i] = residualRow[i] + down[i]
@@ -199,7 +227,45 @@ func (l DecoderLayer) validate(input []float32, sequenceLength int, cache *KVCac
 			return fmt.Errorf("layer %s weight length %d, want %d", check.name, len(check.values), check.want)
 		}
 	}
+	biases := []struct {
+		name   string
+		values []float32
+		want   int
+	}{
+		{"q bias", l.Weights.QBias, queryWidth},
+		{"k bias", l.Weights.KBias, kvWidth},
+		{"v bias", l.Weights.VBias, kvWidth},
+	}
+	for _, check := range biases {
+		if check.values != nil && len(check.values) != check.want {
+			return fmt.Errorf("layer %s length %d, want %d", check.name, len(check.values), check.want)
+		}
+	}
+	if config.Gemma2 {
+		for name, values := range map[string][]float32{
+			"post attention norm":    l.Weights.PostAttentionNorm,
+			"post feed forward norm": l.Weights.PostFeedForwardNorm,
+		} {
+			if len(values) != config.HiddenSize {
+				return fmt.Errorf("layer %s length %d, want %d", name, len(values), config.HiddenSize)
+			}
+		}
+	}
 	return nil
+}
+
+func (l DecoderLayer) rmsNorm(input, weight []float32) ([]float32, error) {
+	if l.Config.NormWeightPlusOne {
+		return RMSNormPlusOne(input, weight, l.Config.NormEpsilon)
+	}
+	return RMSNorm(input, weight, l.Config.NormEpsilon)
+}
+
+func linearOptionalBias(input, weight, bias []float32, inDim, outDim int) ([]float32, error) {
+	if bias == nil {
+		return Linear(input, weight, inDim, outDim)
+	}
+	return LinearBias(input, weight, bias, inDim, outDim)
 }
 
 func ropeHeads(input []float32, sequenceLength, heads, headDim, positionOffset int, theta float64) ([]float32, error) {

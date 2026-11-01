@@ -155,42 +155,51 @@ func (r *Reader) ReadTensor(name string) ([]byte, error) {
 	return data, nil
 }
 
-// LlamaMetadata contains the Llama configuration stored in GGUF metadata.
+// LlamaMetadata contains the dense Llama-like configuration stored in GGUF metadata.
 type LlamaMetadata struct {
-	Architecture     string
-	HiddenSize       int
-	NumHeads         int
-	NumKVHeads       int
-	NumLayers        int
-	IntermediateSize int
-	VocabSize        int
-	RMSNormEpsilon   float64
-	RoPETheta        float64
-	ContextLength    int
-	EOSTokenID       int64
-	BOSTokenID       int64
+	Architecture            string
+	HiddenSize              int
+	NumHeads                int
+	NumKVHeads              int
+	NumLayers               int
+	IntermediateSize        int
+	VocabSize               int
+	RMSNormEpsilon          float64
+	RoPETheta               float64
+	ContextLength           int
+	HeadDim                 int
+	SlidingWindow           int
+	SlidingWindowPattern    int
+	QueryPreAttentionScalar float64
+	AttnLogitSoftcapping    float64
+	FinalLogitSoftcapping   float64
+	EOSTokenID              int64
+	BOSTokenID              int64
 }
 
-// LlamaMetadata extracts and validates the Llama architecture fields.
+// LlamaMetadata extracts and validates dense Llama-family architecture fields.
 func (r *Reader) LlamaMetadata() (LlamaMetadata, error) {
 	var result LlamaMetadata
 	var err error
 	if result.Architecture, err = metadataString(r.metadata, "general.architecture"); err != nil {
 		return LlamaMetadata{}, err
 	}
-	if result.Architecture != "llama" {
-		return LlamaMetadata{}, fmt.Errorf("gguf: unsupported architecture %q: only llama is supported", result.Architecture)
+	switch result.Architecture {
+	case "llama", "qwen2", "gemma", "gemma2":
+	default:
+		return LlamaMetadata{}, fmt.Errorf("gguf: unsupported architecture %q for dense Llama-family conversion", result.Architecture)
 	}
+	prefix := result.Architecture
 	intFields := []struct {
 		key         string
 		destination *int
 	}{
-		{"llama.embedding_length", &result.HiddenSize},
-		{"llama.attention.head_count", &result.NumHeads},
-		{"llama.attention.head_count_kv", &result.NumKVHeads},
-		{"llama.block_count", &result.NumLayers},
-		{"llama.feed_forward_length", &result.IntermediateSize},
-		{"llama.context_length", &result.ContextLength},
+		{prefix + ".embedding_length", &result.HiddenSize},
+		{prefix + ".attention.head_count", &result.NumHeads},
+		{prefix + ".attention.head_count_kv", &result.NumKVHeads},
+		{prefix + ".block_count", &result.NumLayers},
+		{prefix + ".feed_forward_length", &result.IntermediateSize},
+		{prefix + ".context_length", &result.ContextLength},
 	}
 	for _, field := range intFields {
 		value, err := metadataInt(r.metadata, field.key)
@@ -202,32 +211,80 @@ func (r *Reader) LlamaMetadata() (LlamaMetadata, error) {
 		}
 		*field.destination = int(value)
 	}
-	if result.RMSNormEpsilon, err = metadataFloat(r.metadata, "llama.attention.layer_norm_rms_epsilon"); err != nil {
+	if result.RMSNormEpsilon, err = metadataFloat(r.metadata, prefix+".attention.layer_norm_rms_epsilon"); err != nil {
 		return LlamaMetadata{}, err
 	}
 	if result.RMSNormEpsilon <= 0 || math.IsNaN(result.RMSNormEpsilon) || math.IsInf(result.RMSNormEpsilon, 0) {
 		return LlamaMetadata{}, fmt.Errorf("gguf: invalid RMS norm epsilon %v", result.RMSNormEpsilon)
 	}
-	if value, ok := r.metadata["llama.rope.freq_base"]; ok {
-		if result.RoPETheta, err = numberFloat(value); err != nil || result.RoPETheta <= 0 {
-			return LlamaMetadata{}, fmt.Errorf("gguf: invalid llama.rope.freq_base %v", value)
+	if value, ok := r.metadata[prefix+".rope.freq_base"]; ok {
+		if result.RoPETheta, err = numberFloat(value); err != nil || result.RoPETheta <= 0 || math.IsNaN(result.RoPETheta) || math.IsInf(result.RoPETheta, 0) {
+			return LlamaMetadata{}, fmt.Errorf("gguf: invalid %s.rope.freq_base %v", prefix, value)
 		}
 	} else {
 		result.RoPETheta = 10000
 	}
+	result.HeadDim = result.HiddenSize / result.NumHeads
+	for _, key := range []string{prefix + ".attention.key_length", prefix + ".attention.value_length"} {
+		if raw, ok := r.metadata[key]; ok {
+			value, parseErr := numberInt(raw)
+			if parseErr != nil || value <= 0 || value > int64(maxInt()) {
+				return LlamaMetadata{}, fmt.Errorf("gguf: invalid %s %v", key, raw)
+			}
+			result.HeadDim = int(value)
+		}
+	}
+	for _, field := range []struct {
+		key         string
+		destination *int
+	}{
+		{prefix + ".attention.sliding_window", &result.SlidingWindow},
+		{prefix + ".attention.sliding_window_pattern", &result.SlidingWindowPattern},
+	} {
+		if raw, ok := r.metadata[field.key]; ok {
+			value, parseErr := numberInt(raw)
+			if parseErr != nil || value < 0 || value > int64(maxInt()) {
+				return LlamaMetadata{}, fmt.Errorf("gguf: invalid %s %v", field.key, raw)
+			}
+			*field.destination = int(value)
+		}
+	}
+	for _, field := range []struct {
+		key         string
+		destination *float64
+	}{
+		{prefix + ".attention.query_pre_attn_scalar", &result.QueryPreAttentionScalar},
+		{prefix + ".attention.logit_softcapping", &result.AttnLogitSoftcapping},
+		{prefix + ".final_logit_softcapping", &result.FinalLogitSoftcapping},
+	} {
+		if raw, ok := r.metadata[field.key]; ok {
+			value, parseErr := numberFloat(raw)
+			if parseErr != nil || value < 0 || math.IsNaN(value) || math.IsInf(value, 0) {
+				return LlamaMetadata{}, fmt.Errorf("gguf: invalid %s %v", field.key, raw)
+			}
+			*field.destination = value
+		}
+	}
 	if result.EOSTokenID, err = metadataInt(r.metadata, "tokenizer.ggml.eos_token_id"); err != nil {
 		return LlamaMetadata{}, err
 	}
-	if result.BOSTokenID, err = metadataInt(r.metadata, "tokenizer.ggml.bos_token_id"); err != nil {
-		return LlamaMetadata{}, err
+	if raw, ok := r.metadata["tokenizer.ggml.bos_token_id"]; ok {
+		if result.BOSTokenID, err = numberInt(raw); err != nil {
+			return LlamaMetadata{}, fmt.Errorf("gguf: invalid tokenizer.ggml.bos_token_id %v", raw)
+		}
+	} else if result.Architecture == "qwen2" {
+		result.BOSTokenID = result.EOSTokenID
+	} else {
+		return LlamaMetadata{}, errors.New("gguf: missing metadata \"tokenizer.ggml.bos_token_id\"")
 	}
 	tokens, ok := r.metadata["tokenizer.ggml.tokens"].([]string)
 	if !ok || len(tokens) == 0 {
 		return LlamaMetadata{}, errors.New("gguf: tokenizer.ggml.tokens must be a non-empty string array")
 	}
 	result.VocabSize = len(tokens)
-	if result.HiddenSize%result.NumHeads != 0 || result.NumKVHeads > result.NumHeads || result.NumHeads%result.NumKVHeads != 0 {
-		return LlamaMetadata{}, errors.New("gguf: inconsistent Llama attention head dimensions")
+	gemma := result.Architecture == "gemma" || result.Architecture == "gemma2"
+	if !gemma && result.HiddenSize%result.NumHeads != 0 || result.HeadDim%2 != 0 || result.NumKVHeads > result.NumHeads || result.NumHeads%result.NumKVHeads != 0 {
+		return LlamaMetadata{}, fmt.Errorf("gguf: inconsistent %s attention head dimensions", result.Architecture)
 	}
 	if result.EOSTokenID < 0 || result.EOSTokenID >= int64(result.VocabSize) || result.BOSTokenID < 0 || result.BOSTokenID >= int64(result.VocabSize) {
 		return LlamaMetadata{}, errors.New("gguf: BOS or EOS token ID is outside the vocabulary")

@@ -7,8 +7,8 @@ import (
 
 func tokenizerParts(metadata map[string]any) ([]string, []string, error) {
 	model, ok := metadata["tokenizer.ggml.model"].(string)
-	if !ok || model != "llama" {
-		return nil, nil, fmt.Errorf("gguf: tokenizer extraction supports tokenizer.ggml.model=llama, got %v", metadata["tokenizer.ggml.model"])
+	if !ok || model != "llama" && model != "gpt2" {
+		return nil, nil, fmt.Errorf("gguf: tokenizer extraction supports tokenizer.ggml.model=llama or gpt2, got %v", metadata["tokenizer.ggml.model"])
 	}
 	tokens, ok := metadata["tokenizer.ggml.tokens"].([]string)
 	if !ok || len(tokens) == 0 {
@@ -105,6 +105,50 @@ func buildTokenizer(tokens, merges []string, bosID, eosID, unknownID int) map[st
 			"type": "BPE", "dropout": nil, "unk_token": unknown,
 			"continuing_subword_prefix": nil, "end_of_word_suffix": nil,
 			"fuse_unk": false, "byte_fallback": true,
+			"vocab": vocab, "merges": merges,
+		},
+	}
+}
+
+func buildGPT2Tokenizer(tokens, merges []string, eosID int, metadata map[string]any) map[string]any {
+	vocab := make(map[string]int, len(tokens))
+	for id, token := range tokens {
+		vocab[token] = id
+	}
+	special := map[int]struct{}{eosID: {}}
+	if rawTypes, ok := metadata["tokenizer.ggml.token_type"].([]any); ok && len(rawTypes) == len(tokens) {
+		for id, raw := range rawTypes {
+			tokenType, err := numberInt(raw)
+			if err == nil && (tokenType == 3 || tokenType == 4) {
+				special[id] = struct{}{}
+			}
+		}
+	}
+	added := make([]any, 0, len(special))
+	for id := 0; id < len(tokens); id++ {
+		if _, ok := special[id]; !ok {
+			continue
+		}
+		added = append(added, map[string]any{
+			"id": id, "content": tokens[id], "single_word": false,
+			"lstrip": false, "rstrip": false, "normalized": false, "special": true,
+		})
+	}
+	return map[string]any{
+		"version":      "1.0",
+		"truncation":   nil,
+		"padding":      nil,
+		"added_tokens": added,
+		"normalizer":   nil,
+		"pre_tokenizer": map[string]any{
+			"type": "ByteLevel", "add_prefix_space": false, "trim_offsets": true, "use_regex": true,
+		},
+		"post_processor": nil,
+		"decoder":        map[string]any{"type": "ByteLevel", "add_prefix_space": false, "trim_offsets": true, "use_regex": true},
+		"model": map[string]any{
+			"type": "BPE", "dropout": nil, "unk_token": nil,
+			"continuing_subword_prefix": nil, "end_of_word_suffix": nil,
+			"fuse_unk": false, "byte_fallback": false,
 			"vocab": vocab, "merges": merges,
 		},
 	}

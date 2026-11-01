@@ -62,8 +62,10 @@ func (c *KVCache) Append(keys, values []float32, sequenceLength int) error {
 // SlidingWindow disables the window. Sinks contains one learned logit per query
 // head; each sink participates in softmax normalization but has no value vector.
 type AttentionConfig struct {
-	Sinks         []float32
-	SlidingWindow int
+	Sinks                   []float32
+	SlidingWindow           int
+	QueryPreAttentionScalar float64
+	LogitSoftcap            float64
 }
 
 // CausalAttention computes scaled dot-product attention for the most recently
@@ -89,6 +91,12 @@ func CausalAttentionWithConfig(query []float32, numQueryHeads int, cache *KVCach
 	if config.SlidingWindow < 0 {
 		return nil, fmt.Errorf("attention sliding window must be non-negative: %d", config.SlidingWindow)
 	}
+	if config.QueryPreAttentionScalar < 0 || math.IsNaN(config.QueryPreAttentionScalar) || math.IsInf(config.QueryPreAttentionScalar, 0) {
+		return nil, fmt.Errorf("attention query pre-attention scalar must be finite and non-negative: %v", config.QueryPreAttentionScalar)
+	}
+	if config.LogitSoftcap < 0 || math.IsNaN(config.LogitSoftcap) || math.IsInf(config.LogitSoftcap, 0) {
+		return nil, fmt.Errorf("attention logit softcap must be finite and non-negative: %v", config.LogitSoftcap)
+	}
 	queryStride := numQueryHeads * cache.headDim
 	if len(query) == 0 || len(query)%queryStride != 0 {
 		return nil, fmt.Errorf("attention query length %d is not a non-empty multiple of %d", len(query), queryStride)
@@ -102,6 +110,9 @@ func CausalAttentionWithConfig(query []float32, numQueryHeads int, cache *KVCach
 	kvStride := cache.numKVHeads * cache.headDim
 	headsPerKV := numQueryHeads / cache.numKVHeads
 	scale := 1 / math.Sqrt(float64(cache.headDim))
+	if config.QueryPreAttentionScalar > 0 {
+		scale = 1 / math.Sqrt(config.QueryPreAttentionScalar)
+	}
 	scores := make([]float64, cache.length)
 	firstQueryPosition := cache.length - queryLength
 
@@ -128,6 +139,9 @@ func CausalAttentionWithConfig(query []float32, numQueryHeads int, cache *KVCach
 					dot += float64(q[d]) * float64(k[d])
 				}
 				scores[keyPosition] = dot * scale
+				if config.LogitSoftcap > 0 {
+					scores[keyPosition] = config.LogitSoftcap * math.Tanh(scores[keyPosition]/config.LogitSoftcap)
+				}
 				if scores[keyPosition] > maxScore {
 					maxScore = scores[keyPosition]
 				}

@@ -33,8 +33,9 @@ func (r *Runtime) loadDecoderLayer(layer int) (cpuref.DecoderLayer, error) {
 	kvWidth := r.config.NumKeyValueHeads * r.config.HeadDim
 	intermediate := r.config.IntermediateSize
 	weights := cpuref.LayerWeights{}
+	queryWidth := r.config.NumAttentionHeads * r.config.HeadDim
 	var err error
-	if weights.Q, err = readTensor(r.model, prefix+"self_attn.q_proj.weight", hidden, hidden); err != nil {
+	if weights.Q, err = readTensor(r.model, prefix+"self_attn.q_proj.weight", queryWidth, hidden); err != nil {
 		return cpuref.DecoderLayer{}, err
 	}
 	if weights.K, err = readTensor(r.model, prefix+"self_attn.k_proj.weight", kvWidth, hidden); err != nil {
@@ -43,7 +44,18 @@ func (r *Runtime) loadDecoderLayer(layer int) (cpuref.DecoderLayer, error) {
 	if weights.V, err = readTensor(r.model, prefix+"self_attn.v_proj.weight", kvWidth, hidden); err != nil {
 		return cpuref.DecoderLayer{}, err
 	}
-	if weights.O, err = readTensor(r.model, prefix+"self_attn.o_proj.weight", hidden, hidden); err != nil {
+	if r.config.IsQwen2() {
+		if weights.QBias, err = readTensor(r.model, prefix+"self_attn.q_proj.bias", hidden); err != nil {
+			return cpuref.DecoderLayer{}, err
+		}
+		if weights.KBias, err = readTensor(r.model, prefix+"self_attn.k_proj.bias", kvWidth); err != nil {
+			return cpuref.DecoderLayer{}, err
+		}
+		if weights.VBias, err = readTensor(r.model, prefix+"self_attn.v_proj.bias", kvWidth); err != nil {
+			return cpuref.DecoderLayer{}, err
+		}
+	}
+	if weights.O, err = readTensor(r.model, prefix+"self_attn.o_proj.weight", hidden, queryWidth); err != nil {
 		return cpuref.DecoderLayer{}, err
 	}
 	if weights.Gate, err = readTensor(r.model, prefix+"mlp.gate_proj.weight", intermediate, hidden); err != nil {
@@ -58,18 +70,33 @@ func (r *Runtime) loadDecoderLayer(layer int) (cpuref.DecoderLayer, error) {
 	if weights.Norm1, err = readTensor(r.model, prefix+"input_layernorm.weight", hidden); err != nil {
 		return cpuref.DecoderLayer{}, err
 	}
-	if weights.Norm2, err = readTensor(r.model, prefix+"post_attention_layernorm.weight", hidden); err != nil {
+	preFeedForwardNorm := "post_attention_layernorm"
+	if r.config.IsGemma2() {
+		preFeedForwardNorm = "pre_feedforward_layernorm"
+		if weights.PostAttentionNorm, err = readTensor(r.model, prefix+"post_attention_layernorm.weight", hidden); err != nil {
+			return cpuref.DecoderLayer{}, err
+		}
+		if weights.PostFeedForwardNorm, err = readTensor(r.model, prefix+"post_feedforward_layernorm.weight", hidden); err != nil {
+			return cpuref.DecoderLayer{}, err
+		}
+	}
+	if weights.Norm2, err = readTensor(r.model, prefix+preFeedForwardNorm+".weight", hidden); err != nil {
 		return cpuref.DecoderLayer{}, err
 	}
 	return cpuref.DecoderLayer{
 		Config: cpuref.LayerConfig{
-			HiddenSize:       hidden,
-			IntermediateSize: intermediate,
-			NumQueryHeads:    r.config.NumAttentionHeads,
-			NumKVHeads:       r.config.NumKeyValueHeads,
-			HeadDim:          r.config.HeadDim,
-			NormEpsilon:      float32(r.config.RMSNormEps),
-			RoPETheta:        r.config.RopeTheta,
+			HiddenSize:              hidden,
+			IntermediateSize:        intermediate,
+			NumQueryHeads:           r.config.NumAttentionHeads,
+			NumKVHeads:              r.config.NumKeyValueHeads,
+			HeadDim:                 r.config.HeadDim,
+			NormEpsilon:             float32(r.config.RMSNormEps),
+			RoPETheta:               r.config.RopeTheta,
+			NormWeightPlusOne:       r.config.IsGemma(),
+			Gemma2:                  r.config.IsGemma2(),
+			QueryPreAttentionScalar: r.config.QueryPreAttentionScalar,
+			AttentionLogitSoftcap:   r.config.AttnLogitSoftcapping,
+			SlidingWindow:           r.config.LayerSlidingWindow(layer),
 		},
 		Weights: weights,
 	}, nil

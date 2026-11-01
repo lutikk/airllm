@@ -32,16 +32,17 @@ func (p LayerPlanner) MaxLayerBytes() uint64 {
 	c := p.config
 	hidden := uint64(c.HiddenSize)
 	intermediate := uint64(c.IntermediateSize)
+	queryWidth := uint64(c.NumAttentionHeads) * uint64(c.HeadDim)
 	kvWidth := uint64(c.NumKeyValueHeads) * uint64(c.HeadDim)
 
-	// Q and O projections are hidden x hidden. K and V use the narrower GQA
-	// width; SwiGLU has gate, up, and down projections. Two RMSNorm vectors
-	// accompany these projections in every transformer layer.
+	// Q and O use query width (which differs from hidden size for some Gemma2
+	// models); K and V use the narrower GQA width.
 	elements := saturatingAdd(
-		saturatingMultiply(2, hidden, hidden),
+		saturatingMultiply(2, hidden, queryWidth),
 		saturatingMultiply(2, hidden, kvWidth),
+		p.qkvBiasElements(),
 		saturatingMultiply(3, hidden, intermediate),
-		saturatingMultiply(2, hidden),
+		saturatingMultiply(uint64(p.normCount()), hidden),
 	)
 	return saturatingMultiply(elements, p.bytesPerElement)
 }
@@ -94,13 +95,31 @@ func (p LayerPlanner) residentWeightBytes() uint64 {
 func (p LayerPlanner) layerElements() uint64 {
 	c := p.config
 	hidden := uint64(c.HiddenSize)
+	queryWidth := uint64(c.NumAttentionHeads) * uint64(c.HeadDim)
 	kvWidth := uint64(c.NumKeyValueHeads) * uint64(c.HeadDim)
 	return saturatingAdd(
-		saturatingMultiply(2, hidden, hidden),
+		saturatingMultiply(2, hidden, queryWidth),
 		saturatingMultiply(2, hidden, kvWidth),
+		p.qkvBiasElements(),
 		saturatingMultiply(3, hidden, uint64(c.IntermediateSize)),
-		saturatingMultiply(2, hidden),
+		saturatingMultiply(uint64(p.normCount()), hidden),
 	)
+}
+
+func (p LayerPlanner) normCount() int {
+	if p.config.IsGemma2() {
+		return 4
+	}
+	return 2
+}
+
+func (p LayerPlanner) qkvBiasElements() uint64 {
+	if !p.config.IsQwen2() {
+		return 0
+	}
+	hidden := uint64(p.config.HiddenSize)
+	kvWidth := uint64(p.config.NumKeyValueHeads) * uint64(p.config.HeadDim)
+	return saturatingAdd(hidden, saturatingMultiply(2, kvWidth))
 }
 
 func saturatingAdd(values ...uint64) uint64 {

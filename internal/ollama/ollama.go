@@ -83,6 +83,45 @@ func Pull(ctx context.Context, modelRef, destDir string, progress func(Progress)
 	return (&Client{}).Pull(ctx, modelRef, destDir, progress)
 }
 
+// Inspection describes a resolved model without downloading its GGUF weights.
+type Inspection struct {
+	Manifest  Manifest
+	Model     Layer
+	ModelSize int64
+	Config    json.RawMessage
+}
+
+type resolvedModel struct {
+	ref          reference
+	session      *session
+	manifest     Manifest
+	manifestData []byte
+	model        Layer
+}
+
+// Inspect resolves a model reference and downloads only its manifest and small
+// config blob. Model contains the selected GGUF layer, including its media type
+// and size; Config is nil when the manifest has no config descriptor.
+func (c *Client) Inspect(ctx context.Context, modelRef string) (Inspection, error) {
+	resolved, err := c.resolve(ctx, modelRef)
+	if err != nil {
+		return Inspection{}, err
+	}
+	inspection := Inspection{
+		Manifest:  resolved.manifest,
+		Model:     resolved.model,
+		ModelSize: resolved.model.Size,
+	}
+	if resolved.manifest.Config.Digest != "" {
+		config, err := c.readConfig(ctx, resolved)
+		if err != nil {
+			return Inspection{}, err
+		}
+		inspection.Config = config
+	}
+	return inspection, nil
+}
+
 // Pull downloads a manifest, its GGUF model layer, and any config or license
 // layers. The files are named model.gguf, config.json, LICENSE, and
 // manifest.json. Large blobs stream through .part files and are renamed only
@@ -91,7 +130,7 @@ func (c *Client) Pull(ctx context.Context, modelRef, destDir string, progress fu
 	if destDir == "" {
 		return errors.New("ollama: destination directory is empty")
 	}
-	ref, err := parseReference(modelRef, c.BaseURL)
+	resolved, err := c.resolve(ctx, modelRef)
 	if err != nil {
 		return err
 	}
@@ -99,40 +138,12 @@ func (c *Client) Pull(ctx context.Context, modelRef, destDir string, progress fu
 		return fmt.Errorf("ollama: create destination directory: %w", err)
 	}
 
-	s := &session{client: c, token: c.Token}
-	manifestURL := ref.baseURL + "/v2/" + escapePath(ref.repository) + "/manifests/" + url.PathEscape(ref.tag)
-	resp, err := s.get(ctx, manifestURL, "")
-	if err != nil {
-		return fmt.Errorf("ollama: download manifest: %w", err)
-	}
-	manifestData, readErr := io.ReadAll(io.LimitReader(resp.Body, manifestLimit+1))
-	closeErr := resp.Body.Close()
-	if readErr != nil {
-		return fmt.Errorf("ollama: read manifest: %w", readErr)
-	}
-	if closeErr != nil {
-		return fmt.Errorf("ollama: close manifest response: %w", closeErr)
-	}
-	if len(manifestData) > manifestLimit {
-		return errors.New("ollama: manifest exceeds 16 MiB")
-	}
-	var manifest Manifest
-	if err := json.Unmarshal(manifestData, &manifest); err != nil {
-		return fmt.Errorf("ollama: decode manifest: %w", err)
-	}
-
-	model, err := selectModel(manifest.Layers)
-	if err != nil {
-		return err
-	}
-	if err := c.downloadLayer(ctx, s, ref, model, filepath.Join(destDir, "model.gguf"), progress); err != nil {
+	manifest := resolved.manifest
+	if err := c.downloadLayer(ctx, resolved.session, resolved.ref, resolved.model, filepath.Join(destDir, "model.gguf"), progress); err != nil {
 		return err
 	}
 	if manifest.Config.Digest != "" {
-		if manifest.Config.MediaType != "" && manifest.Config.MediaType != configMediaType && manifest.Config.MediaType != "application/vnd.docker.container.image.v1+json" {
-			return fmt.Errorf("ollama: unsupported config media type %q", manifest.Config.MediaType)
-		}
-		if err := c.downloadLayer(ctx, s, ref, manifest.Config, filepath.Join(destDir, "config.json"), progress); err != nil {
+		if err := c.downloadLayer(ctx, resolved.session, resolved.ref, manifest.Config, filepath.Join(destDir, "config.json"), progress); err != nil {
 			return err
 		}
 	}
@@ -146,14 +157,87 @@ func (c *Client) Pull(ctx context.Context, modelRef, destDir string, progress fu
 		if licenseNumber > 1 {
 			name = fmt.Sprintf("LICENSE-%d", licenseNumber)
 		}
-		if err := c.downloadLayer(ctx, s, ref, layer, filepath.Join(destDir, name), progress); err != nil {
+		if err := c.downloadLayer(ctx, resolved.session, resolved.ref, layer, filepath.Join(destDir, name), progress); err != nil {
 			return err
 		}
 	}
-	if err := atomicWrite(filepath.Join(destDir, "manifest.json"), manifestData); err != nil {
+	if err := atomicWrite(filepath.Join(destDir, "manifest.json"), resolved.manifestData); err != nil {
 		return fmt.Errorf("ollama: save manifest: %w", err)
 	}
 	return nil
+}
+
+func (c *Client) resolve(ctx context.Context, modelRef string) (resolvedModel, error) {
+	ref, err := parseReference(modelRef, c.BaseURL)
+	if err != nil {
+		return resolvedModel{}, err
+	}
+	s := &session{client: c, token: c.Token}
+	manifestURL := ref.baseURL + "/v2/" + escapePath(ref.repository) + "/manifests/" + url.PathEscape(ref.tag)
+	resp, err := s.get(ctx, manifestURL, "")
+	if err != nil {
+		return resolvedModel{}, fmt.Errorf("ollama: download manifest: %w", err)
+	}
+	manifestData, readErr := io.ReadAll(io.LimitReader(resp.Body, manifestLimit+1))
+	closeErr := resp.Body.Close()
+	if readErr != nil {
+		return resolvedModel{}, fmt.Errorf("ollama: read manifest: %w", readErr)
+	}
+	if closeErr != nil {
+		return resolvedModel{}, fmt.Errorf("ollama: close manifest response: %w", closeErr)
+	}
+	if len(manifestData) > manifestLimit {
+		return resolvedModel{}, errors.New("ollama: manifest exceeds 16 MiB")
+	}
+	var manifest Manifest
+	if err := json.Unmarshal(manifestData, &manifest); err != nil {
+		return resolvedModel{}, fmt.Errorf("ollama: decode manifest: %w", err)
+	}
+	model, err := selectModel(manifest.Layers)
+	if err != nil {
+		return resolvedModel{}, err
+	}
+	if model.Size < 0 {
+		return resolvedModel{}, fmt.Errorf("ollama: invalid negative size for %s", model.Digest)
+	}
+	if manifest.Config.Digest != "" && manifest.Config.MediaType != "" && manifest.Config.MediaType != configMediaType && manifest.Config.MediaType != "application/vnd.docker.container.image.v1+json" {
+		return resolvedModel{}, fmt.Errorf("ollama: unsupported config media type %q", manifest.Config.MediaType)
+	}
+	return resolvedModel{ref: ref, session: s, manifest: manifest, manifestData: manifestData, model: model}, nil
+}
+
+func (c *Client) readConfig(ctx context.Context, resolved resolvedModel) (json.RawMessage, error) {
+	layer := resolved.manifest.Config
+	if layer.Size < 0 || layer.Size > manifestLimit {
+		return nil, fmt.Errorf("ollama: invalid config size %d", layer.Size)
+	}
+	if _, err := parseDigest(layer.Digest); err != nil {
+		return nil, err
+	}
+	blobURL := resolved.ref.baseURL + "/v2/" + escapePath(resolved.ref.repository) + "/blobs/" + layer.Digest
+	resp, err := resolved.session.get(ctx, blobURL, "")
+	if err != nil {
+		return nil, fmt.Errorf("ollama: download config: %w", err)
+	}
+	data, readErr := io.ReadAll(io.LimitReader(resp.Body, manifestLimit+1))
+	closeErr := resp.Body.Close()
+	if readErr != nil {
+		return nil, fmt.Errorf("ollama: read config: %w", readErr)
+	}
+	if closeErr != nil {
+		return nil, fmt.Errorf("ollama: close config response: %w", closeErr)
+	}
+	if int64(len(data)) != layer.Size {
+		return nil, fmt.Errorf("ollama: config size mismatch: got %d bytes, want %d", len(data), layer.Size)
+	}
+	digest := sha256.Sum256(data)
+	if got := "sha256:" + hex.EncodeToString(digest[:]); got != strings.ToLower(layer.Digest) {
+		return nil, fmt.Errorf("ollama: config digest mismatch: got %s", got)
+	}
+	if !json.Valid(data) {
+		return nil, errors.New("ollama: config is not valid JSON")
+	}
+	return json.RawMessage(data), nil
 }
 
 func selectModel(layers []Layer) (Layer, error) {

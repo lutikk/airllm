@@ -423,8 +423,22 @@ func (ui *desktopUI) download(ctx context.Context, params downloadParams) (strin
 		}
 		return localDir, nil
 	case sourceOllama:
+		ui.setStatus("Проверка модели и свободного места…")
+		client := &ollama.Client{}
+		inspection, err := client.Inspect(ctx, params.model)
+		if err != nil {
+			return "", fmt.Errorf("проверка модели %s в Ollama registry: %w", params.model, err)
+		}
+		freeBytes, err := diskFreeBytes(params.modelDir)
+		if err != nil {
+			return "", fmt.Errorf("проверка свободного места для %s: %w", params.modelDir, err)
+		}
+		if _, err := planOllamaDownload(inspection, freeBytes); err != nil {
+			return "", err
+		}
+		ui.setStatus("Будет скачано " + formatByteSize(uint64(inspection.ModelSize)) + ".")
 		pullDir := filepath.Join(params.modelDir, "ollama", safeModelReference(params.model))
-		err := ollama.Pull(ctx, params.model, pullDir, func(progress ollama.Progress) {
+		err = client.Pull(ctx, params.model, pullDir, func(progress ollama.Progress) {
 			ui.setDownloadProgress(progress.Filename, progress.Downloaded, progress.Total)
 		})
 		if err != nil {

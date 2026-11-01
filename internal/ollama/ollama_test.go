@@ -363,3 +363,49 @@ func assertNotExists(t *testing.T, filename string) {
 		t.Fatalf("%s exists or stat failed: %v", filename, err)
 	}
 }
+
+func TestInspectResolvesManifestModelAndConfigWithoutWeights(t *testing.T) {
+	model := []byte("large GGUF contents must not be downloaded")
+	config := []byte(`{"architecture":"llama","parameter_size":"1.1B"}`)
+	manifest := makeManifest(t, model, config, nil)
+	manifestData, _ := json.Marshal(manifest)
+	modelRequests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v2/library/tinyllama/manifests/latest":
+			_, _ = w.Write(manifestData)
+		case "/v2/library/tinyllama/blobs/" + manifest.Config.Digest:
+			_, _ = w.Write(config)
+		case "/v2/library/tinyllama/blobs/" + manifest.Layers[0].Digest:
+			modelRequests++
+			_, _ = w.Write(model)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	client := &Client{BaseURL: server.URL, HTTPClient: server.Client()}
+	inspection, err := client.Inspect(context.Background(), "tinyllama")
+	if err != nil {
+		t.Fatalf("Inspect: %v", err)
+	}
+	if inspection.Manifest.MediaType != manifest.MediaType {
+		t.Errorf("manifest media type = %q, want %q", inspection.Manifest.MediaType, manifest.MediaType)
+	}
+	if inspection.Model.MediaType != modelMediaType || inspection.Model.Digest != manifest.Layers[0].Digest {
+		t.Errorf("model layer = %+v", inspection.Model)
+	}
+	if inspection.ModelSize != int64(len(model)) {
+		t.Errorf("model size = %d, want %d", inspection.ModelSize, len(model))
+	}
+	if inspection.Manifest.Config.MediaType != configMediaType {
+		t.Errorf("config media type = %q", inspection.Manifest.Config.MediaType)
+	}
+	if string(inspection.Config) != string(config) {
+		t.Errorf("config = %s, want %s", inspection.Config, config)
+	}
+	if modelRequests != 0 {
+		t.Fatalf("Inspect downloaded model blob %d times", modelRequests)
+	}
+}

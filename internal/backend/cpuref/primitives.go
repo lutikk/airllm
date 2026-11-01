@@ -71,6 +71,33 @@ func RMSNorm(input, weight []float32, epsilon float32) ([]float32, error) {
 	return output, nil
 }
 
+// RMSNormPlusOne applies Gemma's zero-centered norm weights as (1 + weight).
+func RMSNormPlusOne(input, weight []float32, epsilon float32) ([]float32, error) {
+	if len(weight) != len(input) {
+		return nil, fmt.Errorf("rmsnorm weight length %d, want %d", len(weight), len(input))
+	}
+	adjusted := make([]float32, len(weight))
+	for i, value := range weight {
+		adjusted[i] = 1 + value
+	}
+	return RMSNorm(input, adjusted, epsilon)
+}
+
+// ApproximateGELUGate computes tanh-approximate GELU(gate) * up, used by Gemma.
+func ApproximateGELUGate(gate, up []float32) ([]float32, error) {
+	if len(gate) != len(up) {
+		return nil, fmt.Errorf("gelu gate lengths differ: %d and %d", len(gate), len(up))
+	}
+	output := make([]float32, len(gate))
+	for i, value := range gate {
+		x := float64(value)
+		cubic := 0.044715 * x * x * x
+		inner := math.Sqrt(2/math.Pi) * (x + cubic)
+		output[i] = float32(0.5*x*(1+math.Tanh(inner))) * up[i]
+	}
+	return output, nil
+}
+
 // SiLU applies x * sigmoid(x) element-wise.
 func SiLU(input []float32) []float32 {
 	output := make([]float32, len(input))
