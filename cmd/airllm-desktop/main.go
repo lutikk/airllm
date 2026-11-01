@@ -12,7 +12,11 @@ import (
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/app"
+	"fyne.io/fyne/v2/canvas"
 	"fyne.io/fyne/v2/container"
+	"fyne.io/fyne/v2/dialog"
+	"fyne.io/fyne/v2/layout"
+	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 	"github.com/lutikk/airllm/internal/hub"
 	"github.com/lutikk/airllm/internal/model/llama"
@@ -21,15 +25,31 @@ import (
 )
 
 const (
-	defaultModel   = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
-	defaultMemory  = "4GiB"
-	defaultContext = "2048"
-	defaultTokens  = "64"
-	workspaceBytes = 256 << 20
+	defaultModel       = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+	defaultMemory      = "4GiB"
+	defaultContext     = "2048"
+	defaultTokens      = "64"
+	workspaceBytes     = 256 << 20
+	modelDirPreference = "modelDownloadDir"
+	modelDirectoryHelp = `Идентификатор модели Hugging Face
+В поле «Модель» укажите ID в формате org/repo, например TinyLlama/TinyLlama-1.1B-Chat-v1.0. ID копируется со страницы модели на huggingface.co. Этот небольшой чат-пример подходит для первой проверки, но CPU reference всё равно работает медленно.
+
+Закрытые модели
+Если репозиторий gated или private, сначала получите доступ на его странице. Затем создайте токен в настройках Hugging Face и задайте переменную окружения HF_TOKEN до запуска AirLLM. Не вставляйте токен в поле модели.
+
+Необходимые файлы
+В репозитории или локальной папке должны быть config.json, tokenizer.json и веса safetensors. Для разбитой модели нужны все части весов и model.safetensors.index.json, если он входит в репозиторий.
+
+Локальная модель
+Вместо HF ID можно указать полный путь к уже распакованной папке модели. В этом случае AirLLM ничего не скачивает.
+
+Каталог загрузки и диск
+Файлы из Hugging Face сохраняются в выбранный каталог и используются повторно. Модели могут занимать от нескольких гигабайтов до десятков и сотен гигабайтов: заранее проверьте размер файлов на странице репозитория и свободное место. Кнопка «Выбрать» позволяет использовать другой диск; выбор сохраняется между запусками.`
 )
 
 type runParams struct {
 	model         string
+	modelDir      string
 	prompt        string
 	memoryLimit   uint64
 	contextLength int
@@ -39,18 +59,20 @@ type runParams struct {
 type desktopUI struct {
 	window fyne.Window
 
-	modelEntry   *widget.Entry
-	promptEntry  *widget.Entry
-	memoryEntry  *widget.Entry
-	contextEntry *widget.Entry
-	tokensEntry  *widget.Entry
-	hardwareText *widget.Label
-	statusText   *widget.Label
-	outputText   *widget.Label
-	outputScroll *container.Scroll
-	progress     *widget.ProgressBar
-	runButton    *widget.Button
-	cancelButton *widget.Button
+	modelEntry    *widget.Entry
+	modelDirEntry *widget.Entry
+	promptEntry   *widget.Entry
+	memoryEntry   *widget.Entry
+	contextEntry  *widget.Entry
+	tokensEntry   *widget.Entry
+	hardwareText  *widget.Label
+	diskSpaceText *widget.Label
+	statusText    *widget.Label
+	outputText    *widget.Label
+	outputScroll  *container.Scroll
+	progress      *widget.ProgressBar
+	runButton     *widget.Button
+	cancelButton  *widget.Button
 
 	active bool
 	cancel context.CancelFunc
@@ -58,9 +80,10 @@ type desktopUI struct {
 
 func main() {
 	application := app.NewWithID("io.github.lutikk.airllm.desktop")
+	application.Settings().SetTheme(&darkTheme{})
 	window := application.NewWindow("AirLLM — локальная генерация")
 	newDesktopUI(window)
-	window.Resize(fyne.NewSize(960, 820))
+	window.Resize(fyne.NewSize(1280, 820))
 	window.ShowAndRun()
 }
 
@@ -69,6 +92,8 @@ func newDesktopUI(window fyne.Window) *desktopUI {
 	ui.modelEntry = widget.NewEntry()
 	ui.modelEntry.SetText(defaultModel)
 	ui.modelEntry.SetPlaceHolder("org/repo или /путь/к/модели")
+
+	ui.modelDirEntry = widget.NewEntry()
 
 	ui.promptEntry = widget.NewMultiLineEntry()
 	ui.promptEntry.SetPlaceHolder("Введите запрос для модели…")
@@ -81,48 +106,117 @@ func newDesktopUI(window fyne.Window) *desktopUI {
 	ui.tokensEntry = widget.NewEntry()
 	ui.tokensEntry.SetText(defaultTokens)
 
-	ui.hardwareText = widget.NewLabel("Определение оборудования…")
-	ui.hardwareText.Wrapping = fyne.TextWrapWord
-	ui.statusText = widget.NewLabel("Готово. Используется медленный CPU reference; Metal пока не задействован.")
-	ui.statusText.Wrapping = fyne.TextWrapWord
-	ui.outputText = widget.NewLabel("")
+	ui.hardwareText = sectionLabel("Определение оборудования…")
+	ui.diskSpaceText = sectionLabel("Определение свободного места…")
+	ui.statusText = sectionLabel("Готово. Используется медленный CPU reference; Metal пока не задействован.")
+	ui.outputText = widget.NewLabel("Здесь появится результат генерации.")
 	ui.outputText.Wrapping = fyne.TextWrapWord
 	ui.outputScroll = container.NewVScroll(ui.outputText)
 	ui.progress = widget.NewProgressBar()
 	ui.progress.SetValue(0)
-	ui.runButton = widget.NewButton("Запустить", ui.start)
-	ui.cancelButton = widget.NewButton("Отмена", ui.stop)
+	ui.runButton = widget.NewButtonWithIcon("Запустить", theme.MediaPlayIcon(), ui.start)
+	ui.runButton.Importance = widget.HighImportance
+	ui.cancelButton = widget.NewButtonWithIcon("Отмена", theme.CancelIcon(), ui.stop)
 	ui.cancelButton.Disable()
 
-	settings := widget.NewForm(
-		widget.NewFormItem("Модель HF или путь", ui.modelEntry),
-		widget.NewFormItem("Лимит памяти", ui.memoryEntry),
-		widget.NewFormItem("Контекст", ui.contextEntry),
-		widget.NewFormItem("Макс. новых токенов", ui.tokensEntry),
+	preferences := fyne.CurrentApp().Preferences()
+	ui.modelDirEntry.SetText(savedModelDir(preferences))
+	ui.modelDirEntry.OnChanged = func(path string) {
+		preferences.SetString(modelDirPreference, strings.TrimSpace(path))
+		ui.updateDiskSpace()
+	}
+
+	chooseDirButton := widget.NewButtonWithIcon("Выбрать", theme.FolderOpenIcon(), func() {
+		folderDialog := dialog.NewFolderOpen(func(uri fyne.ListableURI, err error) {
+			if err != nil {
+				dialog.ShowError(fmt.Errorf("не получилось выбрать каталог: %w", err), window)
+				return
+			}
+			if uri == nil {
+				return
+			}
+			ui.modelDirEntry.SetText(uri.Path())
+			preferences.SetString(modelDirPreference, uri.Path())
+			ui.updateDiskSpace()
+		}, window)
+		folderDialog.Show()
+	})
+	helpButton := widget.NewButtonWithIcon("Как получить модель", theme.HelpIcon(), func() {
+		dialog.ShowInformation("Как получить модель", modelDirectoryHelp, window)
+	})
+
+	directoryRow := container.NewBorder(nil, nil, nil, chooseDirButton, ui.modelDirEntry)
+	directorySettings := container.NewVBox(
+		sectionLabel("Каталог для загрузки моделей"),
+		directoryRow,
+		ui.diskSpaceText,
 	)
-	header := widget.NewLabelWithStyle("AirLLM", fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
-	top := container.NewVBox(
-		header,
-		settings,
-		widget.NewLabel("Запрос"),
-		ui.promptEntry,
-		container.NewHBox(ui.runButton, ui.cancelButton),
+	modelSettings := styledCard("Модель", "HF ID или путь к локальной папке", container.NewVBox(
+		ui.modelEntry,
+		helpButton,
 		widget.NewSeparator(),
-		ui.hardwareText,
-		ui.statusText,
-		ui.progress,
-		widget.NewLabel("Результат"),
-	)
-	window.SetContent(container.NewBorder(
-		container.NewPadded(top), nil, nil, nil,
-		container.NewPadded(ui.outputScroll),
+		directorySettings,
 	))
 
+	memoryField := container.NewVBox(sectionLabel("Лимит памяти"), ui.memoryEntry)
+	contextField := container.NewVBox(sectionLabel("Контекст"), ui.contextEntry)
+	tokensField := container.NewVBox(sectionLabel("Новых токенов"), ui.tokensEntry)
+	generationSettings := styledCard("Параметры генерации", "", container.NewGridWithColumns(2,
+		memoryField, contextField, tokensField,
+	))
+	hardwareCard := styledCard("Среда выполнения", "", ui.hardwareText)
+	settingsScroll := container.NewVScroll(container.NewVBox(modelSettings, generationSettings, hardwareCard))
+	actions := container.NewGridWithColumns(2, ui.runButton, ui.cancelButton)
+	left := container.NewPadded(container.NewBorder(nil, container.NewVBox(actions, ui.statusText), nil, nil, settingsScroll))
+
+	promptCard := styledCard("Запрос", "Текст будет передан модели после загрузки", ui.promptEntry)
+	resultCard := styledCard("Результат", "Потоковый вывод токенов", container.NewBorder(nil, ui.progress, nil, nil, ui.outputScroll))
+	right := container.NewPadded(container.NewBorder(promptCard, nil, nil, nil, resultCard))
+
+	split := container.NewHSplit(left, right)
+	split.SetOffset(0.335)
+	window.SetContent(container.NewBorder(ui.header(), nil, nil, nil, split))
+
+	ui.updateDiskSpace()
 	go func() {
 		summary := hardwareSummary(hardware.Probe())
 		fyne.Do(func() { ui.hardwareText.SetText(summary) })
 	}()
 	return ui
+}
+
+func (ui *desktopUI) header() fyne.CanvasObject {
+	background := canvas.NewRectangle(colHeaderBackground)
+	title := canvas.NewText("AirLLM", colForeground)
+	title.TextSize = 14
+	title.TextStyle = fyne.TextStyle{Bold: true}
+	mode := canvas.NewText("Локальная генерация · CPU reference", colDisabled)
+	mode.TextSize = 11
+	row := container.NewHBox(opticallyCentered(title), layout.NewSpacer(), opticallyCentered(mode))
+	content := container.New(layout.NewCustomPaddedLayout(6, 6, 16, 16), row)
+	return container.New(fixedHeightLayout{height: 44}, container.NewStack(background, content))
+}
+
+func (ui *desktopUI) updateDiskSpace() {
+	path := strings.TrimSpace(ui.modelDirEntry.Text)
+	if path == "" {
+		ui.diskSpaceText.SetText("Укажите каталог для расчёта свободного места.")
+		return
+	}
+	ui.diskSpaceText.SetText("Определение свободного места…")
+	go func() {
+		free, err := diskFreeBytes(path)
+		fyne.Do(func() {
+			if strings.TrimSpace(ui.modelDirEntry.Text) != path {
+				return
+			}
+			if err != nil {
+				ui.diskSpaceText.SetText("Свободное место не определено: " + err.Error())
+				return
+			}
+			ui.diskSpaceText.SetText("Свободно на диске: " + formatByteSize(free))
+		})
+	}()
 }
 
 func (ui *desktopUI) start() {
@@ -161,6 +255,10 @@ func (ui *desktopUI) readParams() (runParams, error) {
 	if model == "" {
 		return runParams{}, errors.New("укажите репозиторий Hugging Face или путь к модели")
 	}
+	modelDir := strings.TrimSpace(ui.modelDirEntry.Text)
+	if modelDir == "" {
+		return runParams{}, errors.New("укажите каталог для загрузки моделей")
+	}
 	if strings.TrimSpace(ui.promptEntry.Text) == "" {
 		return runParams{}, errors.New("введите непустой запрос")
 	}
@@ -178,6 +276,7 @@ func (ui *desktopUI) readParams() (runParams, error) {
 	}
 	return runParams{
 		model:         model,
+		modelDir:      modelDir,
 		prompt:        ui.promptEntry.Text,
 		memoryLimit:   memoryLimit,
 		contextLength: contextLength,
@@ -214,7 +313,7 @@ func (ui *desktopUI) execute(ctx context.Context, params runParams) {
 }
 
 func (ui *desktopUI) generate(ctx context.Context, params runParams) (resultErr error) {
-	modelDir, err := resolveModelDir(ctx, params.model)
+	modelDir, err := resolveModelDir(ctx, params.model, params.modelDir)
 	if err != nil {
 		return err
 	}
@@ -312,7 +411,26 @@ func (ui *desktopUI) setStatus(status string) {
 	fyne.Do(func() { ui.statusText.SetText(status) })
 }
 
-func resolveModelDir(ctx context.Context, model string) (string, error) {
+func defaultModelDir() (string, error) {
+	cacheDir, err := os.UserCacheDir()
+	if err != nil {
+		return "", fmt.Errorf("определение каталога кэша: %w", err)
+	}
+	return filepath.Join(cacheDir, "airllm", "models"), nil
+}
+
+func savedModelDir(preferences fyne.Preferences) string {
+	if saved := strings.TrimSpace(preferences.String(modelDirPreference)); saved != "" {
+		return saved
+	}
+	path, err := defaultModelDir()
+	if err != nil {
+		return ""
+	}
+	return path
+}
+
+func resolveModelDir(ctx context.Context, model, downloadDir string) (string, error) {
 	info, err := os.Stat(model)
 	if err == nil {
 		if !info.IsDir() {
@@ -323,15 +441,27 @@ func resolveModelDir(ctx context.Context, model string) (string, error) {
 	if !errors.Is(err, os.ErrNotExist) {
 		return "", fmt.Errorf("проверка локальной модели: %w", err)
 	}
-	cacheDir, err := os.UserCacheDir()
-	if err != nil {
-		return "", fmt.Errorf("определение каталога кэша: %w", err)
+	if strings.TrimSpace(downloadDir) == "" {
+		downloadDir, err = defaultModelDir()
+		if err != nil {
+			return "", err
+		}
 	}
-	modelDir, err := hub.EnsureModel(ctx, model, filepath.Join(cacheDir, "airllm", "models"))
+	if err := os.MkdirAll(downloadDir, 0o755); err != nil {
+		return "", fmt.Errorf("создание каталога загрузки: %w", err)
+	}
+	modelDir, err := hub.EnsureModel(ctx, model, downloadDir)
 	if err != nil {
 		return "", fmt.Errorf("загрузка модели %s из Hugging Face: %w", model, err)
 	}
 	return modelDir, nil
+}
+
+func formatByteSize(bytes uint64) string {
+	if bytes < 1<<30 {
+		return fmt.Sprintf("%.1f МиБ", float64(bytes)/(1<<20))
+	}
+	return fmt.Sprintf("%.1f ГиБ", float64(bytes)/(1<<30))
 }
 
 func hardwareSummary(snapshot hardware.Snapshot) string {
@@ -348,7 +478,7 @@ func hardwareSummary(snapshot hardware.Snapshot) string {
 		gpu = snapshot.GPU.Name
 	}
 	return fmt.Sprintf(
-		"Оборудование: %s/%s · %s · %d ядер · ОЗУ %s · GPU %s\nДоступные бэкенды: CPU · Metal %t · CUDA %t. Сейчас работает только CPU reference (медленно).",
+		"%s/%s · %s · %d ядер · ОЗУ %s · GPU %s\nДоступно: CPU · Metal %t · CUDA %t. Сейчас работает только CPU reference (медленно).",
 		snapshot.CPU.OS, snapshot.CPU.Arch, cpu, snapshot.CPU.Cores, ram, gpu,
 		snapshot.Capabilities.Metal, snapshot.Capabilities.CUDA,
 	)
