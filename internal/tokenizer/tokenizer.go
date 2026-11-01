@@ -3,7 +3,9 @@
 package tokenizer
 
 import (
+	"encoding/json"
 	"fmt"
+	"os"
 	"strings"
 
 	sugarme "github.com/sugarme/tokenizer"
@@ -31,8 +33,12 @@ type addedToken struct {
 // Llama Metaspace and GPT-OSS ByteLevel BPE, o200k Split, TemplateProcessing,
 // added tokens, and decoder chains.
 func NewFromFile(path string) (*Tokenizer, error) {
-	config, err := sugarme.ConfigFromFile(path)
+	data, err := os.ReadFile(path)
 	if err != nil {
+		return nil, fmt.Errorf("load tokenizer config: %w", err)
+	}
+	config := new(sugarme.Config)
+	if err := json.Unmarshal(data, config); err != nil {
 		return nil, fmt.Errorf("load tokenizer config: %w", err)
 	}
 	model, err := newModel(config.Model)
