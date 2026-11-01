@@ -4,6 +4,9 @@
 airllm.egg-info
 build
 dist
+bin/
+airllm
 __pycache__
+.venv/
 # Package README is generated from the top-level README.md at build time
 air_llm/README.md
