@@ -4,6 +4,7 @@ import (
 	"strings"
 	"testing"
 
+	"fyne.io/fyne/v2/widget"
 	"github.com/lutikk/airllm/pkg/hardware"
 )
 
@@ -16,6 +17,38 @@ func TestParsePositiveInt(t *testing.T) {
 		if _, err := parsePositiveInt(input, "контекст"); err == nil {
 			t.Errorf("parsePositiveInt(%q) unexpectedly succeeded", input)
 		}
+	}
+}
+
+func TestReadDownloadParams(t *testing.T) {
+	ui := &desktopUI{
+		modelEntry:    widget.NewEntry(),
+		modelDirEntry: widget.NewEntry(),
+		sourceSelect:  widget.NewSelect([]string{sourceHuggingFace, sourceOllama}, nil),
+	}
+	ui.modelEntry.SetText(" tinyllama:latest ")
+	ui.modelDirEntry.SetText(" /models ")
+	ui.sourceSelect.SetSelected(sourceOllama)
+	params, err := ui.readDownloadParams()
+	if err != nil {
+		t.Fatalf("readDownloadParams: %v", err)
+	}
+	if params.model != "tinyllama:latest" || params.modelDir != "/models" || params.source != sourceOllama {
+		t.Fatalf("unexpected params: %+v", params)
+	}
+
+	ui.sourceSelect.Selected = ""
+	if _, err := ui.readDownloadParams(); err == nil {
+		t.Fatal("readDownloadParams accepted an empty source")
+	}
+}
+
+func TestSafeModelReference(t *testing.T) {
+	if got := safeModelReference("registry.ollama.ai/library/tinyllama:latest"); got != "registry.ollama.ai_library_tinyllama_latest" {
+		t.Fatalf("safeModelReference = %q", got)
+	}
+	if got := safeModelReference("../модель"); strings.ContainsAny(got, "/\\") {
+		t.Fatalf("unsafe model reference %q", got)
 	}
 }
 

@@ -9,6 +9,7 @@ import (
 	sugarme "github.com/sugarme/tokenizer"
 	"github.com/sugarme/tokenizer/decoder"
 	"github.com/sugarme/tokenizer/model/bpe"
+	"github.com/sugarme/tokenizer/normalizer"
 	"github.com/sugarme/tokenizer/pretokenizer"
 	"github.com/sugarme/tokenizer/processor"
 )
@@ -26,16 +27,19 @@ func NewFromFile(path string) (*Tokenizer, error) {
 	if err != nil {
 		return nil, fmt.Errorf("load tokenizer config: %w", err)
 	}
-	if config.Normalizer != nil {
-		return nil, fmt.Errorf("unsupported normalizer %q", config.Normalizer["type"])
-	}
-
 	model, err := newModel(config.Model)
 	if err != nil {
 		return nil, err
 	}
 	inner := sugarme.NewTokenizer(model)
 
+	if config.Normalizer != nil {
+		normalizerChain, err := newNormalizer(config.Normalizer)
+		if err != nil {
+			return nil, err
+		}
+		inner.WithNormalizer(normalizerChain)
+	}
 	if config.PreTokenizer != nil {
 		preTokenizer, err := newPreTokenizer(config.PreTokenizer)
 		if err != nil {
@@ -201,6 +205,44 @@ func (m *byteFallbackModel) Tokenize(sequence string) ([]sugarme.Token, error) {
 		}
 	}
 	return result, nil
+}
+
+func newNormalizer(config map[string]interface{}) (normalizer.Normalizer, error) {
+	switch config["type"] {
+	case "Sequence":
+		rawNormalizers, ok := config["normalizers"].([]interface{})
+		if !ok {
+			return nil, fmt.Errorf("invalid normalizer sequence")
+		}
+		normalizers := make([]normalizer.Normalizer, 0, len(rawNormalizers))
+		for _, raw := range rawNormalizers {
+			value, ok := raw.(map[string]interface{})
+			if !ok {
+				return nil, fmt.Errorf("invalid normalizer in sequence")
+			}
+			item, err := newNormalizer(value)
+			if err != nil {
+				return nil, err
+			}
+			normalizers = append(normalizers, item)
+		}
+		return normalizer.NewSequence(normalizers), nil
+	case "Prepend":
+		prepend, _ := config["prepend"].(string)
+		return normalizer.NewPrepend(prepend), nil
+	case "Replace":
+		pattern, _ := config["pattern"].(map[string]interface{})
+		content, _ := config["content"].(string)
+		if value, ok := pattern["String"].(string); ok {
+			return normalizer.NewReplace(normalizer.String, value, content), nil
+		}
+		if value, ok := pattern["Regex"].(string); ok {
+			return normalizer.NewReplace(normalizer.Regex, value, content), nil
+		}
+		return nil, fmt.Errorf("unsupported Replace normalizer pattern")
+	default:
+		return nil, fmt.Errorf("unsupported normalizer type %q", config["type"])
+	}
 }
 
 func newPreTokenizer(config map[string]interface{}) (sugarme.PreTokenizer, error) {

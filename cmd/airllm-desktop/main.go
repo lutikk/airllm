@@ -18,8 +18,10 @@ import (
 	"fyne.io/fyne/v2/layout"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
+	"github.com/lutikk/airllm/internal/gguf"
 	"github.com/lutikk/airllm/internal/hub"
 	"github.com/lutikk/airllm/internal/model/llama"
+	"github.com/lutikk/airllm/internal/ollama"
 	"github.com/lutikk/airllm/pkg/hardware"
 	"github.com/lutikk/airllm/pkg/memory"
 )
@@ -31,8 +33,16 @@ const (
 	defaultTokens      = "64"
 	workspaceBytes     = 256 << 20
 	modelDirPreference = "modelDownloadDir"
+	sourceHuggingFace  = "Hugging Face"
+	sourceOllama       = "Ollama"
 	modelDirectoryHelp = `Идентификатор модели Hugging Face
 В поле «Модель» укажите ID в формате org/repo, например TinyLlama/TinyLlama-1.1B-Chat-v1.0. ID копируется со страницы модели на huggingface.co. Этот небольшой чат-пример подходит для первой проверки, но CPU reference всё равно работает медленно.
+
+Модель Ollama
+Выберите источник Ollama, укажите ссылку вроде tinyllama:latest и нажмите «Загрузить». AirLLM скачивает GGUF напрямую из Ollama registry: установленная Ollama, её daemon и API не нужны. Затем GGUF конвертируется в локальную модель AirLLM, а поле «Модель» автоматически получает её путь.
+
+Поддерживаемые GGUF
+Конвертация поддерживает Llama-тензоры F32, F16, Q8_0 и Q4_0. Другие квантования пока не поддерживаются: конвертация завершится ошибкой. Результат содержит config.json, tokenizer.json и веса safetensors F16.
 
 Закрытые модели
 Если репозиторий gated или private, сначала получите доступ на его странице. Затем создайте токен в настройках Hugging Face и задайте переменную окружения HF_TOKEN до запуска AirLLM. Не вставляйте токен в поле модели.
@@ -56,23 +66,31 @@ type runParams struct {
 	maxTokens     int
 }
 
+type downloadParams struct {
+	model    string
+	modelDir string
+	source   string
+}
+
 type desktopUI struct {
 	window fyne.Window
 
-	modelEntry    *widget.Entry
-	modelDirEntry *widget.Entry
-	promptEntry   *widget.Entry
-	memoryEntry   *widget.Entry
-	contextEntry  *widget.Entry
-	tokensEntry   *widget.Entry
-	hardwareText  *widget.Label
-	diskSpaceText *widget.Label
-	statusText    *widget.Label
-	outputText    *widget.Label
-	outputScroll  *container.Scroll
-	progress      *widget.ProgressBar
-	runButton     *widget.Button
-	cancelButton  *widget.Button
+	modelEntry     *widget.Entry
+	modelDirEntry  *widget.Entry
+	sourceSelect   *widget.Select
+	promptEntry    *widget.Entry
+	memoryEntry    *widget.Entry
+	contextEntry   *widget.Entry
+	tokensEntry    *widget.Entry
+	hardwareText   *widget.Label
+	diskSpaceText  *widget.Label
+	statusText     *widget.Label
+	outputText     *widget.Label
+	outputScroll   *container.Scroll
+	progress       *widget.ProgressBar
+	runButton      *widget.Button
+	downloadButton *widget.Button
+	cancelButton   *widget.Button
 
 	active bool
 	cancel context.CancelFunc
@@ -94,6 +112,14 @@ func newDesktopUI(window fyne.Window) *desktopUI {
 	ui.modelEntry.SetPlaceHolder("org/repo или /путь/к/модели")
 
 	ui.modelDirEntry = widget.NewEntry()
+	ui.sourceSelect = widget.NewSelect([]string{sourceHuggingFace, sourceOllama}, func(source string) {
+		if source == sourceOllama {
+			ui.modelEntry.SetPlaceHolder("модель:тег, например tinyllama:latest")
+			return
+		}
+		ui.modelEntry.SetPlaceHolder("org/repo или /путь/к/модели")
+	})
+	ui.sourceSelect.SetSelected(sourceHuggingFace)
 
 	ui.promptEntry = widget.NewMultiLineEntry()
 	ui.promptEntry.SetPlaceHolder("Введите запрос для модели…")
@@ -116,6 +142,7 @@ func newDesktopUI(window fyne.Window) *desktopUI {
 	ui.progress.SetValue(0)
 	ui.runButton = widget.NewButtonWithIcon("Запустить", theme.MediaPlayIcon(), ui.start)
 	ui.runButton.Importance = widget.HighImportance
+	ui.downloadButton = widget.NewButtonWithIcon("Загрузить", theme.DownloadIcon(), ui.startDownload)
 	ui.cancelButton = widget.NewButtonWithIcon("Отмена", theme.CancelIcon(), ui.stop)
 	ui.cancelButton.Disable()
 
@@ -151,9 +178,10 @@ func newDesktopUI(window fyne.Window) *desktopUI {
 		directoryRow,
 		ui.diskSpaceText,
 	)
-	modelSettings := styledCard("Модель", "HF ID или путь к локальной папке", container.NewVBox(
+	modelSettings := styledCard("Модель", "HF ID, Ollama ref или путь к локальной папке", container.NewVBox(
+		ui.sourceSelect,
 		ui.modelEntry,
-		helpButton,
+		container.NewGridWithColumns(2, ui.downloadButton, helpButton),
 		widget.NewSeparator(),
 		directorySettings,
 	))
@@ -231,6 +259,7 @@ func (ui *desktopUI) start() {
 
 	ui.active = true
 	ui.runButton.Disable()
+	ui.downloadButton.Disable()
 	ui.cancelButton.Enable()
 	ui.outputText.SetText("")
 	ui.outputScroll.ScrollToTop()
@@ -239,6 +268,45 @@ func (ui *desktopUI) start() {
 	ctx, cancel := context.WithCancel(context.Background())
 	ui.cancel = cancel
 	go ui.execute(ctx, params)
+}
+
+func (ui *desktopUI) startDownload() {
+	if ui.active {
+		return
+	}
+	params, err := ui.readDownloadParams()
+	if err != nil {
+		ui.statusText.SetText("Ошибка: " + err.Error())
+		return
+	}
+
+	ui.active = true
+	ui.runButton.Disable()
+	ui.downloadButton.Disable()
+	ui.cancelButton.Enable()
+	ui.progress.Min = 0
+	ui.progress.Max = 1
+	ui.progress.SetValue(0)
+	ui.statusText.SetText("Подготовка загрузки…")
+	ctx, cancel := context.WithCancel(context.Background())
+	ui.cancel = cancel
+	go ui.executeDownload(ctx, params)
+}
+
+func (ui *desktopUI) readDownloadParams() (downloadParams, error) {
+	model := strings.TrimSpace(ui.modelEntry.Text)
+	if model == "" {
+		return downloadParams{}, errors.New("укажите идентификатор модели")
+	}
+	modelDir := strings.TrimSpace(ui.modelDirEntry.Text)
+	if modelDir == "" {
+		return downloadParams{}, errors.New("укажите каталог для загрузки моделей")
+	}
+	source := ui.sourceSelect.Selected
+	if source != sourceHuggingFace && source != sourceOllama {
+		return downloadParams{}, errors.New("выберите источник Hugging Face или Ollama")
+	}
+	return downloadParams{model: model, modelDir: modelDir, source: source}, nil
 }
 
 func (ui *desktopUI) stop() {
@@ -298,6 +366,7 @@ func (ui *desktopUI) execute(ctx context.Context, params runParams) {
 		ui.active = false
 		ui.cancel = nil
 		ui.runButton.Enable()
+		ui.downloadButton.Enable()
 		ui.cancelButton.Disable()
 		ui.progress.Refresh()
 		switch {
@@ -310,6 +379,92 @@ func (ui *desktopUI) execute(ctx context.Context, params runParams) {
 			ui.statusText.SetText("Генерация завершена. Режим: CPU reference.")
 		}
 	})
+}
+
+func (ui *desktopUI) executeDownload(ctx context.Context, params downloadParams) {
+	localDir, err := ui.download(ctx, params)
+	fyne.Do(func() {
+		ui.active = false
+		ui.cancel = nil
+		ui.runButton.Enable()
+		ui.downloadButton.Enable()
+		ui.cancelButton.Disable()
+		switch {
+		case errors.Is(err, context.Canceled):
+			ui.statusText.SetText("Загрузка отменена.")
+		case err != nil:
+			ui.statusText.SetText("Ошибка: " + err.Error())
+		default:
+			ui.modelEntry.SetText(localDir)
+			ui.progress.Min = 0
+			ui.progress.Max = 1
+			ui.progress.SetValue(1)
+			ui.statusText.SetText("Модель готова: " + localDir)
+		}
+	})
+}
+
+func (ui *desktopUI) download(ctx context.Context, params downloadParams) (string, error) {
+	switch params.source {
+	case sourceHuggingFace:
+		localDir, err := hub.EnsureModelWithProgress(ctx, params.model, params.modelDir, func(progress hub.Progress) {
+			ui.setDownloadProgress(progress.Filename, progress.Downloaded, progress.Total)
+		})
+		if err != nil {
+			return "", fmt.Errorf("загрузка модели %s из Hugging Face: %w", params.model, err)
+		}
+		return localDir, nil
+	case sourceOllama:
+		pullDir := filepath.Join(params.modelDir, "ollama", safeModelReference(params.model))
+		err := ollama.Pull(ctx, params.model, pullDir, func(progress ollama.Progress) {
+			ui.setDownloadProgress(progress.Filename, progress.Downloaded, progress.Total)
+		})
+		if err != nil {
+			return "", fmt.Errorf("загрузка модели %s из Ollama registry: %w", params.model, err)
+		}
+		convertedDir := filepath.Join(pullDir, "airllm")
+		ui.setStatus("Конвертация GGUF в safetensors F16…")
+		fyne.Do(func() {
+			ui.progress.Min = 0
+			ui.progress.Max = 1
+			ui.progress.SetValue(0)
+		})
+		if err := gguf.Convert(ctx, filepath.Join(pullDir, "model.gguf"), convertedDir); err != nil {
+			return "", fmt.Errorf("конвертация GGUF: %w", err)
+		}
+		return convertedDir, nil
+	default:
+		return "", errors.New("неподдерживаемый источник модели")
+	}
+}
+
+func (ui *desktopUI) setDownloadProgress(filename string, downloaded, total int64) {
+	fyne.Do(func() {
+		if total > 0 {
+			ui.progress.Min = 0
+			ui.progress.Max = float64(total)
+			ui.progress.SetValue(float64(downloaded))
+			ui.statusText.SetText(fmt.Sprintf("Загрузка %s: %.1f/%.1f МиБ…", filename, float64(downloaded)/(1<<20), float64(total)/(1<<20)))
+			return
+		}
+		ui.statusText.SetText(fmt.Sprintf("Загрузка %s: %.1f МиБ; общий размер неизвестен…", filename, float64(downloaded)/(1<<20)))
+	})
+}
+
+func safeModelReference(reference string) string {
+	var result strings.Builder
+	for _, r := range reference {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '.', r == '_', r == '-':
+			result.WriteRune(r)
+		default:
+			result.WriteByte('_')
+		}
+	}
+	if result.Len() == 0 {
+		return "model"
+	}
+	return result.String()
 }
 
 func (ui *desktopUI) generate(ctx context.Context, params runParams) (resultErr error) {

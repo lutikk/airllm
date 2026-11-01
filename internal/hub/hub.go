@@ -56,15 +56,32 @@ func (e *StatusError) Error() string {
 	return fmt.Sprintf("hub: resolve %s/%s: %s", e.RepoID, e.Filename, e.Status)
 }
 
+// Progress describes the state of the file currently being downloaded.
+type Progress struct {
+	Filename   string
+	Downloaded int64
+	Total      int64
+}
+
 // EnsureModel downloads a model into cacheDir/repoID and returns its local
 // directory. Existing files are reused. Large files are streamed to disk.
 func EnsureModel(ctx context.Context, repoID, cacheDir string) (string, error) {
-	return (&Client{}).EnsureModel(ctx, repoID, cacheDir)
+	return EnsureModelWithProgress(ctx, repoID, cacheDir, nil)
+}
+
+// EnsureModelWithProgress is EnsureModel with per-file download progress.
+func EnsureModelWithProgress(ctx context.Context, repoID, cacheDir string, progress func(Progress)) (string, error) {
+	return (&Client{}).EnsureModelWithProgress(ctx, repoID, cacheDir, progress)
 }
 
 // EnsureModel downloads a model into cacheDir/repoID and returns its local
 // directory. Existing files are reused. Large files are streamed to disk.
 func (c *Client) EnsureModel(ctx context.Context, repoID, cacheDir string) (string, error) {
+	return c.EnsureModelWithProgress(ctx, repoID, cacheDir, nil)
+}
+
+// EnsureModelWithProgress is EnsureModel with per-file download progress.
+func (c *Client) EnsureModelWithProgress(ctx context.Context, repoID, cacheDir string, progress func(Progress)) (string, error) {
 	if err := validateRepoID(repoID); err != nil {
 		return "", err
 	}
@@ -77,19 +94,22 @@ func (c *Client) EnsureModel(ctx context.Context, repoID, cacheDir string) (stri
 		return "", fmt.Errorf("hub: create model cache: %w", err)
 	}
 
+	download := func(name, destination string) error {
+		return c.DownloadWithProgress(ctx, repoID, name, destination, progress)
+	}
 	for _, name := range requiredFiles {
-		if err := c.Download(ctx, repoID, name, filepath.Join(localDir, filepath.FromSlash(name))); err != nil {
+		if err := download(name, filepath.Join(localDir, filepath.FromSlash(name))); err != nil {
 			return "", err
 		}
 	}
 
 	generationPath := filepath.Join(localDir, "generation_config.json")
-	if err := c.Download(ctx, repoID, "generation_config.json", generationPath); err != nil && !isNotFound(err) {
+	if err := download("generation_config.json", generationPath); err != nil && !isNotFound(err) {
 		return "", err
 	}
 
 	modelPath := filepath.Join(localDir, "model.safetensors")
-	err := c.Download(ctx, repoID, "model.safetensors", modelPath)
+	err := download("model.safetensors", modelPath)
 	if err == nil {
 		return localDir, nil
 	}
@@ -98,7 +118,7 @@ func (c *Client) EnsureModel(ctx context.Context, repoID, cacheDir string) (stri
 	}
 
 	indexPath := filepath.Join(localDir, "model.safetensors.index.json")
-	if err := c.Download(ctx, repoID, "model.safetensors.index.json", indexPath); err != nil {
+	if err := download("model.safetensors.index.json", indexPath); err != nil {
 		return "", fmt.Errorf("hub: neither model.safetensors nor a sharded model index could be downloaded: %w", err)
 	}
 
@@ -134,7 +154,7 @@ func (c *Client) EnsureModel(ctx context.Context, repoID, cacheDir string) (stri
 	}
 	sort.Strings(shards)
 	for _, shard := range shards {
-		if err := c.Download(ctx, repoID, shard, filepath.Join(localDir, filepath.FromSlash(shard))); err != nil {
+		if err := download(shard, filepath.Join(localDir, filepath.FromSlash(shard))); err != nil {
 			return "", err
 		}
 	}
@@ -188,6 +208,16 @@ func (c *Client) Resolve(ctx context.Context, repoID, filename string) (*http.Re
 // A partial file is resumed when the server honors Range requests. The final
 // rename is atomic within the destination directory.
 func (c *Client) Download(ctx context.Context, repoID, filename, destination string) error {
+	return c.DownloadWithProgress(ctx, repoID, filename, destination, nil)
+}
+
+// DownloadWithProgress is Download with byte-level progress for filename.
+func (c *Client) DownloadWithProgress(ctx context.Context, repoID, filename, destination string, progress func(Progress)) error {
+	report := func(downloaded, total int64) {
+		if progress != nil {
+			progress(Progress{Filename: filename, Downloaded: downloaded, Total: total})
+		}
+	}
 	if err := validateFilename(filename); err != nil {
 		return err
 	}
@@ -198,6 +228,7 @@ func (c *Client) Download(ctx context.Context, repoID, filename, destination str
 		if !info.Mode().IsRegular() {
 			return fmt.Errorf("hub: cached file %s is not a regular file", destination)
 		}
+		report(info.Size(), info.Size())
 		return nil
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("hub: inspect cached file: %w", err)
@@ -227,6 +258,7 @@ func (c *Client) Download(ctx context.Context, repoID, filename, destination str
 			if renameErr := os.Rename(partPath, destination); renameErr != nil {
 				return fmt.Errorf("hub: commit download: %w", renameErr)
 			}
+			report(offset, offset)
 			return nil
 		}
 		part.Close()
@@ -261,10 +293,35 @@ func (c *Client) Download(ctx context.Context, repoID, filename, destination str
 		return fmt.Errorf("hub: unexpected download status %s", resp.Status)
 	}
 
+	total := int64(-1)
+	if resp.ContentLength >= 0 {
+		total = offset + resp.ContentLength
+	}
+	downloaded := offset
+	report(downloaded, total)
 	buffer := make([]byte, 128*1024)
-	if _, err := io.CopyBuffer(part, resp.Body, buffer); err != nil {
-		part.Close()
-		return fmt.Errorf("hub: download %s/%s: %w", repoID, filename, err)
+	for {
+		n, readErr := resp.Body.Read(buffer)
+		if n > 0 {
+			written, writeErr := part.Write(buffer[:n])
+			downloaded += int64(written)
+			report(downloaded, total)
+			if writeErr != nil {
+				part.Close()
+				return fmt.Errorf("hub: download %s/%s: %w", repoID, filename, writeErr)
+			}
+			if written != n {
+				part.Close()
+				return fmt.Errorf("hub: download %s/%s: %w", repoID, filename, io.ErrShortWrite)
+			}
+		}
+		if readErr != nil {
+			if !errors.Is(readErr, io.EOF) {
+				part.Close()
+				return fmt.Errorf("hub: download %s/%s: %w", repoID, filename, readErr)
+			}
+			break
+		}
 	}
 	if err := part.Sync(); err != nil {
 		part.Close()
